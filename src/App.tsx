@@ -1,121 +1,152 @@
 import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+
+type BlockMatch = {
+  x: number
+  y: number
+  z: number
+}
+
+type ParseResult = {
+  block_type: string
+  count: number
+  matches: BlockMatch[]
+}
+
+const API_URL = 'http://localhost:8000/parse-blocks'
+const DEFAULT_BLOCK = 'minecraft:nether_portal'
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
+  const [blockType, setBlockType] = useState(DEFAULT_BLOCK)
+  const [loading, setLoading] = useState(false)
+  const [result, setResult] = useState<ParseResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const handleSubmit = async () => {
+    if (!selectedFile) {
+      setError('Choose a zip file first.')
+      return
+    }
+
+    setLoading(true)
+    setError(null)
+    setResult(null)
+
+    try {
+      const form = new FormData()
+      form.append('file', selectedFile)
+      form.append('block_type', blockType)
+
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        body: form,
+      })
+
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { detail?: string } | null
+        throw new Error(payload?.detail ?? `Request failed with status ${response.status}`)
+      }
+
+      setResult((await response.json()) as ParseResult)
+    } catch (submissionError) {
+      setError(submissionError instanceof Error ? submissionError.message : 'Something went wrong')
+    } finally {
+      setLoading(false)
+    }
+  }
 
   return (
-    <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
+    <main className="relative min-h-screen overflow-hidden bg-[#06040d] text-white">
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(168,85,247,0.22),transparent_32%),radial-gradient(circle_at_80%_20%,rgba(99,102,241,0.18),transparent_28%),linear-gradient(180deg,rgba(255,255,255,0.02),transparent_45%)]" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-300/60 to-transparent" />
+
+      <div className="relative mx-auto flex min-h-screen w-full max-w-5xl flex-col items-center px-6 py-10 lg:px-10">
+        <div className="w-full max-w-3xl text-center">
+          <p className="mx-auto mb-6 inline-block text-xs uppercase tracking-[0.5em] text-violet-200/70">
+            Portal Mapper
+          </p>
+          <h1 className="text-4xl font-semibold tracking-tight text-white sm:text-5xl lg:text-6xl">
+            Upload a world zip and scan for a block type.
+          </h1>
+          <p className="mx-auto mt-4 max-w-2xl text-sm leading-7 text-slate-300 sm:text-base">
+            The backend extracts the archive, finds region files, and returns every matching block coordinate.
           </p>
         </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
 
-      <div className="ticks"></div>
+        <section className="mt-10 w-full max-w-3xl rounded-[2rem] border border-violet-300/20 bg-slate-950/60 p-6 shadow-2xl shadow-black/30 backdrop-blur-xl sm:p-8">
+          <div className="grid gap-4 sm:grid-cols-[1.2fr_0.8fr_auto] sm:items-end">
+            <label className="grid gap-2 text-left">
+              <span className="text-xs font-medium uppercase tracking-[0.35em] text-violet-200/70">
+                Zip file
+              </span>
+              <input
+                type="file"
+                accept=".zip,application/zip"
+                onChange={(event) => setSelectedFile(event.target.files?.[0] ?? null)}
+                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200 file:mr-4 file:rounded-full file:border-0 file:bg-violet-400/20 file:px-4 file:py-2 file:text-sm file:font-medium file:text-violet-100 hover:bg-white/7"
+              />
+            </label>
 
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
+            <label className="grid gap-2 text-left">
+              <span className="text-xs font-medium uppercase tracking-[0.35em] text-violet-200/70">
+                Block type
+              </span>
+              <input
+                type="text"
+                value={blockType}
+                onChange={(event) => setBlockType(event.target.value)}
+                placeholder="minecraft:nether_portal"
+                className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-300/40"
+              />
+            </label>
 
-      <div className="ticks"></div>
-      <section id="spacer"></section>
-    </>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={loading}
+              className="inline-flex items-center justify-center rounded-full border border-violet-300/20 bg-violet-500/10 px-5 py-3 text-sm font-medium text-violet-100 shadow-sm transition hover:bg-violet-400/20 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loading ? 'Scanning...' : 'Scan world'}
+            </button>
+          </div>
+
+          {error ? (
+            <p className="mt-5 rounded-2xl border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
+              {error}
+            </p>
+          ) : null}
+
+          {result ? (
+            <div className="mt-6 space-y-4">
+              <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
+                Found {result.count} matching blocks for <span className="text-violet-200">{result.block_type}</span>.
+              </div>
+
+              <div className="overflow-hidden rounded-2xl border border-white/10">
+                <div className="grid grid-cols-3 bg-white/5 px-4 py-3 text-xs uppercase tracking-[0.25em] text-slate-400">
+                  <span>X</span>
+                  <span>Y</span>
+                  <span>Z</span>
+                </div>
+                <div className="max-h-80 divide-y divide-white/10 overflow-auto bg-slate-950/50">
+                  {result.matches.map((match, index) => (
+                    <div key={`${match.x}-${match.y}-${match.z}-${index}`} className="grid grid-cols-3 px-4 py-3 text-sm text-slate-200">
+                      <span>{match.x}</span>
+                      <span>{match.y}</span>
+                      <span>{match.z}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-6 text-sm leading-7 text-slate-300">
+              Upload a zipped save folder, enter a block ID, and the results will appear here.
+            </p>
+          )}
+        </section>
+      </div>
+    </main>
   )
 }
 
