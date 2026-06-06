@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+anvil-parser
+python-multipart
