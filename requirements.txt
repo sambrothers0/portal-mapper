@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
-anvil-parser
+NBT
 python-multipart
