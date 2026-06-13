@@ -1,4 +1,3 @@
 fastapi
 uvicorn[standard]
-NBT
 python-multipart

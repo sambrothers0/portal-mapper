@@ -3,10 +3,9 @@ from __future__ import annotations
 import gzip
 import os
 import zlib
-from io import BytesIO
-from typing import Iterator
+from typing import Callable, Iterator, Mapping
 
-from nbt import nbt
+import fastnbt
 
 # Region files (.mca) layout: a 4 KiB location table (1024 chunks, 4 bytes
 # each) followed by a 4 KiB timestamp table, then chunk payloads aligned to
@@ -24,26 +23,6 @@ _COMPRESSION_NONE = 3
 _EXTERNAL_FLAG = 0x80
 
 
-def find_region_dirs(base: str) -> list[str]:
-    """Return every block-region directory in the save.
-
-    A save stores block data in directories literally named ``region``:
-    the Overworld at ``<world>/region``, the Nether at ``<world>/DIM-1/region``
-    and the End at ``<world>/DIM1/region``. Portal blocks (and any other block)
-    can live in any of them, so we scan them all. Sibling ``.mca`` folders such
-    as ``entities`` and ``poi`` hold different NBT and are intentionally skipped.
-    """
-    region_dirs: list[str] = []
-    for root, _dirs, files in os.walk(base):
-        if os.path.basename(os.path.normpath(root)) != 'region':
-            continue
-        if any(file_name.endswith('.mca') for file_name in files):
-            region_dirs.append(root)
-    if not region_dirs:
-        raise FileNotFoundError('No region files found. Is this a valid Minecraft save?')
-    return region_dirs
-
-
 def _decompress(compression: int, payload: bytes) -> bytes:
     if compression == _COMPRESSION_ZLIB:
         return zlib.decompress(payload)
@@ -54,16 +33,18 @@ def _decompress(compression: int, payload: bytes) -> bytes:
     raise ValueError(f'Unsupported chunk compression id {compression}')
 
 
-def _iter_region_chunks(path: str) -> Iterator[nbt.NBTFile]:
-    """Yield the parsed NBT of every generated chunk in a ``.mca`` file.
+def _walk_region(data: bytes, read_external: Callable[[int, int], bytes | None]) -> Iterator[bytes]:
+    """Yield the decompressed NBT bytes of every generated chunk in a region file.
 
-    Chunks that are absent, truncated, or fail to decode are skipped rather
+    ``data`` is the raw ``.mca`` content. ``read_external(chunk_x, chunk_z)``
+    supplies the payload of an oversized chunk's sibling ``c.<x>.<z>.mcc`` file
+    (returning ``None`` when it can't be found); this is the one piece that
+    differs between reading from disk and reading straight from the upload zip.
+
+    Chunks that are absent, truncated, or fail to decompress are skipped rather
     than aborting the whole region, mirroring how a corrupt chunk should not
     sink an otherwise-readable save.
     """
-    with open(path, 'rb') as handle:
-        data = handle.read()
-
     # A valid region file always carries the full 4 KiB location table; a
     # shorter file (e.g. a 0-byte placeholder) holds no chunks.
     if len(data) < _LOCATION_TABLE_BYTES:
@@ -86,13 +67,8 @@ def _iter_region_chunks(path: str) -> Iterator[nbt.NBTFile]:
 
         if compression & _EXTERNAL_FLAG:
             # Oversized chunk: payload lives in a sibling c.<x>.<z>.mcc file.
-            chunk_x = entry % 32
-            chunk_z = entry // 32
-            external = os.path.join(os.path.dirname(path), f'c.{chunk_x}.{chunk_z}.mcc')
-            try:
-                with open(external, 'rb') as ext_handle:
-                    payload = ext_handle.read()
-            except OSError:
+            payload = read_external(entry % 32, entry // 32)
+            if payload is None:
                 continue
             compression &= ~_EXTERNAL_FLAG
         else:
@@ -100,10 +76,25 @@ def _iter_region_chunks(path: str) -> Iterator[nbt.NBTFile]:
             payload = data[start + 5:start + 4 + length]
 
         try:
-            raw = _decompress(compression, payload)
-            yield nbt.NBTFile(buffer=BytesIO(raw))
+            yield _decompress(compression, payload)
         except Exception:
             continue
+
+
+def _iter_region_chunks(path: str) -> Iterator[bytes]:
+    """Yield decompressed chunk bytes from a ``.mca`` on disk (``.mcc`` siblings alongside)."""
+    with open(path, 'rb') as handle:
+        data = handle.read()
+
+    def read_external(chunk_x: int, chunk_z: int) -> bytes | None:
+        external = os.path.join(os.path.dirname(path), f'c.{chunk_x}.{chunk_z}.mcc')
+        try:
+            with open(external, 'rb') as ext_handle:
+                return ext_handle.read()
+        except OSError:
+            return None
+
+    yield from _walk_region(data, read_external)
 
 
 def normalize_block_type(block_type: str) -> str:
@@ -112,79 +103,35 @@ def normalize_block_type(block_type: str) -> str:
     return block_type
 
 
-def _decode_section(data: list[int], bits: int):
-    """Yield ``(local_index, palette_index)`` for all 4096 blocks in a section.
-
-    Modern (>= 1.16 / 20w17a) packing does not let a palette index straddle a
-    64-bit long boundary, so each long holds ``64 // bits`` whole indices.
-    """
-    per_long = 64 // bits
-    mask = (1 << bits) - 1
-    idx = 0
-    for long_val in data:
-        if long_val < 0:
-            long_val += 1 << 64
-        for _ in range(per_long):
-            if idx >= 4096:
-                return
-            yield idx, long_val & mask
-            long_val >>= bits
-            idx += 1
-
-
-def scan_region_file(file_path: str, block_type: str) -> list[dict[str, int]]:
-    """Return the world coordinates of every ``block_type`` block in one ``.mca``.
+def scan_region_bytes(
+    mca_bytes: bytes,
+    mcc_map: Mapping[str, bytes],
+    block_type: str,
+) -> list[dict[str, int]]:
+    """Return the world coordinates of every ``block_type`` block in one region file.
 
     This is the unit of parallel work: each region file is independent, so the
-    server fans these calls out across a process pool. Keeping it a plain
-    module-level function (taking only picklable ``str`` arguments and returning
-    a plain list of dicts) is what lets it cross the process boundary.
+    server reads its bytes from the upload zip and fans these calls across a
+    process pool — no temp files. ``mca_bytes`` is the raw ``.mca`` content and
+    ``mcc_map`` maps ``c.<x>.<z>.mcc`` sidecar names to their bytes (usually
+    empty; oversized chunks are rare). All arguments are picklable so the call
+    crosses the process boundary cleanly.
     """
     target_block = normalize_block_type(block_type)
     matches: list[dict[str, int]] = []
 
-    for chunk in _iter_region_chunks(file_path):
-        world_chunk_x = chunk['xPos'].value
-        world_chunk_z = chunk['zPos'].value
+    def read_external(chunk_x: int, chunk_z: int) -> bytes | None:
+        return mcc_map.get(f'c.{chunk_x}.{chunk_z}.mcc')
 
-        for section in chunk['sections']:
-            block_states = section['block_states']
-            palette = block_states['palette']
-            names = [block['Name'].value for block in palette]
-            if target_block not in names:
-                continue
-
-            section_y = section['Y'].value
-
-            # A section with no ``data`` is uniformly palette[0].
-            if 'data' not in block_states:
-                decoded = ((i, 0) for i in range(4096))
-            else:
-                bits = max((len(palette) - 1).bit_length(), 4)
-                decoded = _decode_section(block_states['data'].value, bits)
-
-            for local_index, palette_index in decoded:
-                if names[palette_index] != target_block:
-                    continue
-
-                x = local_index % 16
-                z = (local_index // 16) % 16
-                y = local_index // 256
-                matches.append(
-                    {
-                        'x': world_chunk_x * 16 + x,
-                        'y': section_y * 16 + y,
-                        'z': world_chunk_z * 16 + z,
-                    }
-                )
-
+    for chunk in _walk_region(mca_bytes, read_external):
+        fastnbt.scan_chunk(chunk, target_block, matches)
     return matches
 
 
-def scan_for_block(region_dir: str, block_type: str) -> list[dict[str, int]]:
-    """Scan every ``.mca`` in a single region directory (sequential convenience)."""
+def scan_region_file(file_path: str, block_type: str) -> list[dict[str, int]]:
+    """Scan one ``.mca`` on disk (kept for benchmarks and direct-from-disk callers)."""
+    target_block = normalize_block_type(block_type)
     matches: list[dict[str, int]] = []
-    for file_name in os.listdir(region_dir):
-        if file_name.endswith('.mca'):
-            matches.extend(scan_region_file(os.path.join(region_dir, file_name), block_type))
+    for chunk in _iter_region_chunks(file_path):
+        fastnbt.scan_chunk(chunk, target_block, matches)
     return matches
