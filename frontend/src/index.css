@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #06040d;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+/* Animated ambient background — a few large, heavily blurred blobs in dark
+   violet/indigo that drift and breathe slowly across the page. The layer is
+   fixed so the glow stays present as you scroll down to the map. Each blob has
+   its own long, offset cycle so they never line up into an obvious loop. */
+.bg-blobs {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.blob {
+  position: absolute;
+  border-radius: 9999px;
+  filter: blur(90px);
+  will-change: transform, opacity;
+}
+
+.blob-1 {
+  top: -8%;
+  left: -6%;
+  width: 46vmax;
+  height: 46vmax;
+  background: radial-gradient(circle, rgba(124, 58, 237, 0.34), rgba(124, 58, 237, 0) 70%);
+  animation: blob-drift-1 34s ease-in-out infinite alternate;
+}
+
+.blob-2 {
+  top: -4%;
+  right: -10%;
+  width: 40vmax;
+  height: 40vmax;
+  background: radial-gradient(circle, rgba(79, 70, 229, 0.3), rgba(79, 70, 229, 0) 70%);
+  animation: blob-drift-2 42s ease-in-out infinite alternate;
+}
+
+.blob-3 {
+  top: 40%;
+  left: 30%;
+  width: 52vmax;
+  height: 52vmax;
+  background: radial-gradient(circle, rgba(139, 92, 246, 0.2), rgba(139, 92, 246, 0) 70%);
+  animation: blob-drift-3 50s ease-in-out infinite alternate;
+}
+
+.blob-4 {
+  bottom: -12%;
+  right: 4%;
+  width: 44vmax;
+  height: 44vmax;
+  background: radial-gradient(circle, rgba(67, 56, 202, 0.26), rgba(67, 56, 202, 0) 70%);
+  animation: blob-drift-4 46s ease-in-out infinite alternate;
+}
+
+@keyframes blob-drift-1 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+    opacity: 0.7;
+  }
+  100% {
+    transform: translate3d(12vw, 18vh, 0) scale(1.18);
+    opacity: 0.95;
+  }
+}
+
+@keyframes blob-drift-2 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1.1);
+    opacity: 0.6;
+  }
+  100% {
+    transform: translate3d(-14vw, 22vh, 0) scale(0.92);
+    opacity: 0.9;
+  }
+}
+
+@keyframes blob-drift-3 {
+  0% {
+    transform: translate3d(-8vw, -6vh, 0) scale(0.95);
+    opacity: 0.5;
+  }
+  100% {
+    transform: translate3d(10vw, -14vh, 0) scale(1.2);
+    opacity: 0.8;
+  }
+}
+
+@keyframes blob-drift-4 {
+  0% {
+    transform: translate3d(0, 6vh, 0) scale(1.05);
+    opacity: 0.55;
+  }
+  100% {
+    transform: translate3d(-12vw, -10vh, 0) scale(0.9);
+    opacity: 0.85;
+  }
+}
+
+/* Indeterminate progress bar for the backend processing phase — there's no real
+   percent to report, so a violet segment sweeps left-to-right on a loop to show
+   the server is still working. */
+.indeterminate-bar {
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  border-radius: 9999px;
+  background: linear-gradient(to right, transparent, rgb(167 139 250), rgb(129 140 248), transparent);
+  box-shadow: 0 0 12px rgba(168, 85, 247, 0.6);
+  animation: indeterminate-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes indeterminate-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blob {
+    animation: none;
+  }
+
+  .indeterminate-bar {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
+  }
+}
+
