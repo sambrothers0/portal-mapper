@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Test data (large zips, not for version control)
+testing/
+
+# Claude Code memory (personal/local)
+.claude/
