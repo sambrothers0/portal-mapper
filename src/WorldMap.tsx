@@ -319,11 +319,21 @@ export function WorldMap({ matches }: Props) {
     scheduleDraw()
   }, [matches, scheduleDraw])
 
-  // Cancel any in-flight animation frames when the map unmounts.
+  // Cancel any in-flight animation frames when the map unmounts. We MUST null
+  // the refs after cancelling: under StrictMode the component mounts, unmounts,
+  // then remounts, and a stale non-null rafRef would make scheduleDraw's
+  // `if (rafRef.current != null) return` guard wedge forever — no interactive
+  // repaint (zoom, pan-during-drag) would ever fire again.
   useEffect(() => {
     return () => {
-      if (rafRef.current != null) cancelAnimationFrame(rafRef.current)
-      if (inertiaRef.current != null) cancelAnimationFrame(inertiaRef.current)
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current)
+        rafRef.current = null
+      }
+      if (inertiaRef.current != null) {
+        cancelAnimationFrame(inertiaRef.current)
+        inertiaRef.current = null
+      }
     }
   }, [])
 
@@ -343,10 +353,14 @@ export function WorldMap({ matches }: Props) {
       const beforeX = view.cx + (px - w / 2) / view.ppb
       const beforeZ = view.cz + (py - h / 2) / view.ppb
       // Normalise line-mode wheels (≈1 per notch) to pixel-mode (≈100) so the
-      // step feels the same across devices, then a healthy gain so a single
-      // notch is a real zoom — no more grinding the wheel.
+      // step feels the same across devices.
       const delta = event.deltaMode === 1 ? event.deltaY * 100 : event.deltaY
-      const factor = Math.exp(-delta * 0.0035)
+      // A trackpad pinch arrives as ctrl+wheel with much smaller per-event deltas
+      // than a mouse notch (but many events per gesture). Give it a higher gain
+      // so a pinch zooms at about the same rate as the wheel; both sit between the
+      // original speed and the faster pass — quicker than first, gentler than peak.
+      const gain = event.ctrlKey ? 0.017 : 0.00425
+      const factor = Math.exp(-delta * gain)
       const ppb = clamp(view.ppb * factor, MIN_PPB, MAX_PPB)
       // Keep the world point under the cursor pinned in place.
       view.cx = beforeX - (px - w / 2) / ppb
@@ -482,8 +496,9 @@ export function WorldMap({ matches }: Props) {
         </div>
       ) : null}
 
-      {/* Zoom + fit controls */}
-      <div className="absolute right-3 top-3 flex items-center gap-2">
+      {/* Zoom + fit controls — kept top-left so they don't cover the "X →" axis
+          chip the canvas draws in the top-right corner. */}
+      <div className="absolute left-3 top-3 flex items-center gap-2">
         <span className="pointer-events-none rounded-lg border border-violet-300/15 bg-slate-950/70 px-2 py-1 font-mono text-[11px] tabular-nums text-violet-200/80 backdrop-blur-sm">
           {zoomPct}%
         </span>

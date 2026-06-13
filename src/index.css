@@ -123,9 +123,37 @@ body {
   }
 }
 
+/* Indeterminate progress bar for the backend processing phase — there's no real
+   percent to report, so a violet segment sweeps left-to-right on a loop to show
+   the server is still working. */
+.indeterminate-bar {
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  border-radius: 9999px;
+  background: linear-gradient(to right, transparent, rgb(167 139 250), rgb(129 140 248), transparent);
+  box-shadow: 0 0 12px rgba(168, 85, 247, 0.6);
+  animation: indeterminate-sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes indeterminate-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(350%);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .blob {
     animation: none;
+  }
+
+  .indeterminate-bar {
+    animation: none;
+    width: 100%;
+    opacity: 0.5;
   }
 }
 

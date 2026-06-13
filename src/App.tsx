@@ -177,17 +177,24 @@ function App() {
 
   // While the server is processing, rotate the flavor text with a fade: drop to
   // opacity 0, swap the line once it's faded out, then fade the new line back in.
+  // The swap timeout is tracked alongside the interval so both are torn down on
+  // cleanup — otherwise a pending swap could fire after the phase has moved on.
   useEffect(() => {
     if (phase !== 'processing') return
+    setMessageIndex(0)
+    setMessageVisible(true)
+    let swap: ReturnType<typeof setTimeout> | undefined
     const interval = setInterval(() => {
       setMessageVisible(false)
-      const swap = setTimeout(() => {
+      swap = setTimeout(() => {
         setMessageIndex((index) => (index + 1) % PROCESSING_MESSAGES.length)
         setMessageVisible(true)
       }, 400)
-      return () => clearTimeout(swap)
     }, 2800)
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      if (swap) clearTimeout(swap)
+    }
   }, [phase])
 
   const handleSubmit = async () => {
@@ -247,14 +254,16 @@ function App() {
         <div className="blob blob-3" />
         <div className="blob blob-4" />
       </div>
-      <div className="relative z-10 mx-auto flex w-full max-w-2xl flex-col items-center px-6 pt-20 text-center">
+      <div className="relative z-10 mx-auto flex w-full max-w-2xl flex-col items-center px-6 pt-14 text-center sm:pt-20">
         {/* Header */}
         <div className="w-full">
-          <p className="mb-14 inline-block text-6xl uppercase tracking-[1em] text-violet-200/70">
+          {/* Tighter size/tracking on phones so the wide letter-spacing doesn't
+              overflow the viewport; full drama from sm up. */}
+          <p className="mb-10 inline-block text-4xl uppercase tracking-[0.4em] text-violet-200/70 sm:mb-14 sm:text-6xl sm:tracking-[1em]">
             TAROT
           </p>
           <h1 className="text-2xl font-semibold tracking-tight text-white sm:text-5xl lg:text-4xl">
-            Instantly visualize any block type in your Minecraft world
+            Instantly plot any block type in your Minecraft world
           </h1>
           <p className="mx-auto mt-4 max-w-xl text-sm leading-7 text-slate-300 sm:text-base">
             Locate forgotten nether portals, builds, or previously explored areas
@@ -382,20 +391,21 @@ function App() {
             </div>
           ) : null}
 
-          {/* Processing phase — no real progress signal, so cycle flavor text. */}
+          {/* Processing phase — the backend gives no percent, so the determinate
+              bar is replaced by an indeterminate sweep with cycling flavor text. */}
           {phase === 'processing' ? (
             <div className="mt-6 text-left">
-              <div className="flex items-center gap-3 rounded-2xl border border-violet-300/15 bg-violet-500/5 px-4 py-3">
-                <span className="relative flex h-2.5 w-2.5 shrink-0">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-300/70" />
-                  <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-violet-300" />
-                </span>
-                <p
-                  className={`text-sm text-violet-100 transition-opacity duration-300 ${messageVisible ? 'opacity-100' : 'opacity-0'}`}
-                >
-                  {PROCESSING_MESSAGES[messageIndex]}
-                </p>
+              <div className="mb-2 flex items-center justify-between text-xs font-medium uppercase tracking-[0.35em] text-violet-200/70">
+                <span>Scanning world</span>
               </div>
+              <div className="relative h-2 w-full overflow-hidden rounded-full border border-white/10 bg-white/5">
+                <span className="indeterminate-bar" />
+              </div>
+              <p
+                className={`mt-2 text-xs text-violet-100/90 transition-opacity duration-300 ${messageVisible ? 'opacity-100' : 'opacity-0'}`}
+              >
+                {PROCESSING_MESSAGES[messageIndex]}
+              </p>
             </div>
           ) : null}
 
@@ -449,9 +459,11 @@ function App() {
       {/* Divider between the upload section and the map */}
       <div className="relative z-10 mx-auto mt-16 h-px w-full max-w-2xl bg-gradient-to-r from-transparent via-violet-300/25 to-transparent" />
 
-      {/* Map — square, sized to 90% of the smaller viewport dimension */}
+      {/* Map — square, sized to 90% of the smaller viewport dimension. max-w-full
+          + aspect-square keeps it square while never spilling past the page
+          padding on narrow portrait phones (where 90vmin == 90vw). */}
       <div className="relative z-10 mx-auto mt-12 flex w-full flex-col items-center px-6">
-        <div className="relative h-[90vmin] w-[90vmin] overflow-hidden rounded-3xl border border-violet-300/15 bg-slate-950/40 shadow-2xl shadow-black/40 backdrop-blur-sm">
+        <div className="relative aspect-square w-[90vmin] max-w-full overflow-hidden rounded-3xl border border-violet-300/15 bg-slate-950/40 shadow-2xl shadow-black/40 backdrop-blur-sm">
           {result ? (
             <WorldMap matches={result.matches} />
           ) : (
