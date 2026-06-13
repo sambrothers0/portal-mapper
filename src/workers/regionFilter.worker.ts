@@ -23,6 +23,9 @@ export type RegionFilterRequest = {
 
 export type RegionFilterResponse =
   | { type: 'filtered'; fileName: string; blob: Blob; entryCount: number }
+  // Emitted while repacking so the UI can show a real progress bar for the
+  // compress/trim phase, the same way the upload phase tracks bytes sent.
+  | { type: 'progress'; percent: number }
   | { type: 'error'; message: string }
 
 // Mirror of the backend's `_region_dimension`: a save keeps each dimension's
@@ -47,17 +50,11 @@ self.addEventListener('message', async (event: MessageEvent<RegionFilterRequest>
     const source = await JSZip.loadAsync(file)
     const out = new JSZip()
 
-    let entryCount = 0
-    for (const entry of Object.values(source.files)) {
-      if (entry.dir || regionDimension(entry.name) !== dimension) continue
-      // Repack with STORE: `.mca` chunks are already zlib-compressed internally,
-      // so re-deflating them at the zip layer burns CPU for almost no shrink.
-      const data = await entry.async('uint8array')
-      out.file(entry.name, data, { compression: 'STORE' })
-      entryCount += 1
-    }
+    const matches = Object.values(source.files).filter(
+      (entry) => !entry.dir && regionDimension(entry.name) === dimension,
+    )
 
-    if (entryCount === 0) {
+    if (matches.length === 0) {
       const result: RegionFilterResponse = {
         type: 'error',
         message:
@@ -68,7 +65,30 @@ self.addEventListener('message', async (event: MessageEvent<RegionFilterRequest>
       return
     }
 
-    const blob = await out.generateAsync({ type: 'blob', compression: 'STORE' })
+    // Reading the region files out of the source zip is the heavy part, so it
+    // drives most of the bar (0–90%); the STORE repack at the end fills 90–100%.
+    let processed = 0
+    for (const entry of matches) {
+      // Repack with STORE: `.mca` chunks are already zlib-compressed internally,
+      // so re-deflating them at the zip layer burns CPU for almost no shrink.
+      const data = await entry.async('uint8array')
+      out.file(entry.name, data, { compression: 'STORE' })
+      processed += 1
+      const progress: RegionFilterResponse = {
+        type: 'progress',
+        percent: Math.round((processed / matches.length) * 90),
+      }
+      self.postMessage(progress)
+    }
+
+    const entryCount = matches.length
+    const blob = await out.generateAsync({ type: 'blob', compression: 'STORE' }, (metadata) => {
+      const progress: RegionFilterResponse = {
+        type: 'progress',
+        percent: 90 + Math.round((metadata.percent / 100) * 10),
+      }
+      self.postMessage(progress)
+    })
     const result: RegionFilterResponse = { type: 'filtered', fileName, blob, entryCount }
     self.postMessage(result)
   } catch (error) {

@@ -49,7 +49,11 @@ type Phase = 'idle' | 'filtering' | 'uploading' | 'processing'
 // win: a multi-GB save usually carries a few hundred MB of region files for one
 // dimension, so we upload that instead of the whole world. Paths are preserved
 // so the backend still derives the dimension itself.
-function filterDimension(file: File, dimension: Dimension): Promise<File> {
+function filterDimension(
+  file: File,
+  dimension: Dimension,
+  onProgress: (percent: number) => void,
+): Promise<File> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./workers/regionFilter.worker.ts', import.meta.url), {
       type: 'module',
@@ -57,6 +61,12 @@ function filterDimension(file: File, dimension: Dimension): Promise<File> {
 
     worker.onmessage = (event: MessageEvent<RegionFilterResponse>) => {
       const data = event.data
+      // Progress ticks keep streaming while the worker repacks — report and wait
+      // for the terminal 'filtered'/'error' message before tearing the worker down.
+      if (data.type === 'progress') {
+        onProgress(data.percent)
+        return
+      }
       worker.terminate()
       if (data.type === 'filtered') {
         // Keep a .zip name so the backend's extension check passes.
@@ -151,6 +161,20 @@ function App() {
     }
   }
 
+  // Reflect the current phase in the browser tab title so progress is legible
+  // even when the tab is backgrounded during a long scan.
+  useEffect(() => {
+    const suffix =
+      phase === 'filtering'
+        ? 'Compressing'
+        : phase === 'uploading'
+          ? 'Uploading'
+          : phase === 'processing'
+            ? 'Processing'
+            : 'Home'
+    document.title = `Tarot - ${suffix}`
+  }, [phase])
+
   // While the server is processing, rotate the flavor text with a fade: drop to
   // opacity 0, swap the line once it's faded out, then fade the new line back in.
   useEffect(() => {
@@ -189,9 +213,12 @@ function App() {
 
     try {
       // Strip the save to just this dimension's region files before uploading.
-      const filtered = await filterDimension(selectedFile, dimension)
+      // The compress/trim phase drives the bar 0→100, then we reset it so the
+      // upload phase tracks bytes sent from zero.
+      const filtered = await filterDimension(selectedFile, dimension, setUploadProgress)
 
       setPhase('uploading')
+      setUploadProgress(0)
       const form = new FormData()
       form.append('file', filtered)
       form.append('block_type', blockType)
@@ -220,8 +247,6 @@ function App() {
         <div className="blob blob-3" />
         <div className="blob blob-4" />
       </div>
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-px bg-gradient-to-r from-transparent via-violet-300/60 to-transparent" />
-
       <div className="relative z-10 mx-auto flex w-full max-w-2xl flex-col items-center px-6 pt-20 text-center">
         {/* Header */}
         <div className="w-full">
@@ -320,18 +345,23 @@ function App() {
             </button>
           </div>
 
-          {/* Filtering phase — paring the save down to one dimension in-browser. */}
+          {/* Filtering phase — paring the save down to one dimension in-browser,
+              with a real progress bar for the compress/trim work. */}
           {phase === 'filtering' ? (
             <div className="mt-6 text-left">
-              <div className="flex items-center gap-3 rounded-2xl border border-violet-300/15 bg-violet-500/5 px-4 py-3">
-                <span className="relative flex h-2.5 w-2.5 shrink-0">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-violet-300/70" />
-                  <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-violet-300" />
-                </span>
-                <p className="text-sm text-violet-100">
-                  Paring your world down to the {dimensionLabel(dimension)} — only those region files travel.
-                </p>
+              <div className="mb-2 flex items-center justify-between text-xs font-medium uppercase tracking-[0.35em] text-violet-200/70">
+                <span>Compressing world</span>
+                <span className="tabular-nums text-violet-100">{uploadProgress}%</span>
               </div>
+              <div className="h-2 w-full overflow-hidden rounded-full border border-white/10 bg-white/5">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-violet-400 to-indigo-400 shadow-[0_0_12px_rgba(168,85,247,0.6)] transition-all duration-300"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+              <p className="mt-2 text-xs text-slate-500">
+                Paring your world down to the {dimensionLabel(dimension)} — only those region files travel.
+              </p>
             </div>
           ) : null}
 
@@ -445,6 +475,9 @@ function App() {
         </p>
       </div>
 
+      {/* Divider between the map and the footer */}
+      <div className="relative z-10 mx-auto mt-16 h-px w-full max-w-2xl bg-gradient-to-r from-transparent via-violet-300/25 to-transparent" />
+
       {/* Footer */}
       <footer className="relative z-10 pb-16">
         <p className="mx-auto mt-8 max-w-2xl text-center text-sm text-slate-400 sm:text-base">
@@ -461,7 +494,7 @@ function App() {
 
         <div className="mx-auto mt-6 flex items-center justify-center gap-3">
           <a
-            href="https://github.com/sambrothers0"
+            href="https://github.com/sambrothers0/portal-mapper"
             className="rounded-full p-1.5 text-violet-200/70 transition hover:bg-white/10 hover:text-violet-100"
             target="_blank"
             rel="noreferrer"
