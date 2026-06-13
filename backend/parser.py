@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import gzip
 import os
 import zlib
 from typing import Callable, Iterator, Mapping
@@ -22,15 +21,31 @@ _COMPRESSION_ZLIB = 2
 _COMPRESSION_NONE = 3
 _EXTERNAL_FLAG = 0x80
 
+# Hard ceiling on a single chunk's decompressed NBT. A real chunk is a few
+# hundred KB; this generous cap stops a crafted "compression bomb" chunk from
+# inflating to gigabytes in a worker. Over-large chunks raise (and are skipped
+# by ``_walk_region`` like any other unreadable chunk).
+_MAX_CHUNK_DECOMPRESSED = 64 * 1024 * 1024
+# gzip streams are decoded through zlib with this window so we can bound output.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+
 
 def _decompress(compression: int, payload: bytes) -> bytes:
-    if compression == _COMPRESSION_ZLIB:
-        return zlib.decompress(payload)
-    if compression == _COMPRESSION_GZIP:
-        return gzip.decompress(payload)
     if compression == _COMPRESSION_NONE:
+        # Uncompressed: already bounded by the region member's own size.
         return payload
-    raise ValueError(f'Unsupported chunk compression id {compression}')
+    if compression == _COMPRESSION_ZLIB:
+        obj = zlib.decompressobj()
+    elif compression == _COMPRESSION_GZIP:
+        obj = zlib.decompressobj(wbits=_GZIP_WBITS)
+    else:
+        raise ValueError(f'Unsupported chunk compression id {compression}')
+    # Decompress with a hard output cap; anything left over means the chunk
+    # would exceed the ceiling, so treat it as unreadable rather than OOM.
+    data = obj.decompress(payload, _MAX_CHUNK_DECOMPRESSED)
+    if obj.unconsumed_tail or obj.unused_data:
+        raise ValueError('chunk decompresses beyond the allowed size')
+    return data
 
 
 def _walk_region(data: bytes, read_external: Callable[[int, int], bytes | None]) -> Iterator[bytes]:
@@ -107,8 +122,9 @@ def scan_region_bytes(
     mca_bytes: bytes,
     mcc_map: Mapping[str, bytes],
     block_type: str,
-) -> list[dict[str, int]]:
-    """Return the world coordinates of every ``block_type`` block in one region file.
+    limit: int,
+) -> tuple[int, list[dict[str, int]]]:
+    """Count ``block_type`` blocks in one region file, returning ``(count, sample)``.
 
     This is the unit of parallel work: each region file is independent, so the
     server reads its bytes from the upload zip and fans these calls across a
@@ -116,22 +132,33 @@ def scan_region_bytes(
     ``mcc_map`` maps ``c.<x>.<z>.mcc`` sidecar names to their bytes (usually
     empty; oversized chunks are rare). All arguments are picklable so the call
     crosses the process boundary cleanly.
+
+    ``count`` is the true total found; the returned coordinate list is capped at
+    ``limit`` so a block that occurs millions of times (e.g. ``stone``) can't
+    build a multi-GB list in the worker. A single malformed/crafted chunk is
+    skipped rather than failing the whole region.
     """
     target_block = normalize_block_type(block_type)
-    matches: list[dict[str, int]] = []
+    sink = fastnbt.MatchSink(limit)
 
     def read_external(chunk_x: int, chunk_z: int) -> bytes | None:
         return mcc_map.get(f'c.{chunk_x}.{chunk_z}.mcc')
 
     for chunk in _walk_region(mca_bytes, read_external):
-        fastnbt.scan_chunk(chunk, target_block, matches)
-    return matches
+        try:
+            fastnbt.scan_chunk(chunk, target_block, sink)
+        except Exception:
+            continue
+    return sink.count, sink.matches
 
 
-def scan_region_file(file_path: str, block_type: str) -> list[dict[str, int]]:
+def scan_region_file(file_path: str, block_type: str, limit: int = 1_000_000) -> list[dict[str, int]]:
     """Scan one ``.mca`` on disk (kept for benchmarks and direct-from-disk callers)."""
     target_block = normalize_block_type(block_type)
-    matches: list[dict[str, int]] = []
+    sink = fastnbt.MatchSink(limit)
     for chunk in _iter_region_chunks(file_path):
-        fastnbt.scan_chunk(chunk, target_block, matches)
-    return matches
+        try:
+            fastnbt.scan_chunk(chunk, target_block, sink)
+        except Exception:
+            continue
+    return sink.matches

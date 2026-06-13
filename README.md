@@ -98,9 +98,19 @@ Production — run **without** `--reload`:
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-The API is available at `http://localhost:8000`. CORS is currently open to all
-origins. When running behind a reverse proxy, raise the proxy's body-size limit
-and read timeout to allow multi-gigabyte uploads.
+The API is available at `http://localhost:8000`. CORS defaults to open (`*`) for
+local dev; set `ALLOWED_ORIGINS` to the frontend's origin in production. When
+running behind a reverse proxy, raise the proxy's body-size limit and read
+timeout to allow multi-gigabyte uploads. See `deploy/` for a hardened nginx
+config and the full public-deployment checklist.
+
+**Configuration (env vars):**
+
+| Var | Default | Purpose |
+|---|---|---|
+| `ALLOWED_ORIGINS` | `*` | Comma-separated origins allowed to call the API. |
+| `MAX_CONCURRENT_SCANS` | `1` | How many scans may run at once. One scan gets every core (fastest completion) and bounds memory; raise only with RAM headroom. Extra requests get `503`. |
+| `FULL_ACCESS_KEYS` | *(empty)* | Comma-separated access codes that raise the upload limit from 250 MB to 4 GB. Sent by the client in the `X-Access-Key` header. Empty = nobody has full access. |
 
 ### How it works
 
@@ -131,9 +141,12 @@ Accepts a multipart form upload.
 
 | Field | Type | Description |
 |---|---|---|
-| `file` | `.zip` file | Zipped Minecraft save folder (max 4 GB) |
+| `file` | `.zip` file | Zipped Minecraft save folder. Upload limit is 250 MB, or 4 GB with a valid access code (see header below). |
 | `block_type` | string (optional) | Block type to search for (default: `minecraft:nether_portal`). A value without a namespace, e.g. `stone`, is normalized to `minecraft:stone`. |
 | `dimension` | string (optional) | Which dimension to scan: `overworld` (default), `nether`, or `end`. Only that dimension's region files are extracted and parsed. |
+
+Optional header `X-Access-Key`: one of the server's `FULL_ACCESS_KEYS`. A valid
+code raises the upload limit from 250 MB to 4 GB.
 
 The dimension is resolved from the save's directory layout: the Overworld's
 `region/` sits in the world root, the Nether's under `DIM-1/`, and the End's
@@ -155,21 +168,25 @@ curl -X POST http://localhost:8000/parse-blocks \
   "block_type": "minecraft:nether_portal",
   "dimension": "nether",
   "count": 3,
+  "truncated": false,
   "matches": [
     { "x": 128, "y": 64, "z": -512 }
   ]
 }
 ```
 
-Coordinates are absolute world coordinates.
+Coordinates are absolute world coordinates. `count` is the true total found;
+`matches` is capped at 100,000 entries, with `truncated: true` when the cap was
+hit.
 
 **Error responses:**
 
 | Status | When |
 |---|---|
 | `400` | Upload is missing, not a `.zip`, not a valid zip archive, or `dimension` is not one of `overworld`/`nether`/`end` |
-| `413` | Upload exceeds the 4 GB limit (checked via `Content-Length`) |
+| `413` | Upload exceeds the tier limit — 250 MB, or 4 GB with a valid `X-Access-Key` (checked via `Content-Length`, before the body is read) |
 | `422` | No region files found for the requested dimension (not a valid save, or that dimension was never visited) |
+| `503` | Server is already running a scan (`MAX_CONCURRENT_SCANS` reached); includes a `Retry-After` header — retry shortly |
 
 Each error body is `{ "detail": "<message>" }`.
 
@@ -221,14 +238,18 @@ npm run lint     # run ESLint
 ### How it works
 
 1. **Pick a save + dimension.** The selected `.zip` is validated against the
-   4 GB limit on both select and submit.
+   hard 4 GB ceiling on both select and submit. An optional access code (with a
+   show/hide toggle, remembered in `localStorage`) raises the upload limit.
 2. **Filter in the browser** (`src/workers/regionFilter.worker.ts`). Before any
    upload, a web worker pares the save down to just the chosen dimension's
    `region/*.mca` (+ `.mcc`) files, repacked with the original paths preserved.
    This commonly shrinks a multi-GB upload by an order of magnitude. The blob is
    passed by reference so a 4 GB save is never read into a main-thread buffer.
-3. **Upload + scan.** The filtered zip is POSTed to the backend with a real
-   byte-level progress bar; once it lands, the backend scans and returns matches.
+   The *filtered* result is then checked against the upload limit (250 MB, or
+   4 GB with a valid access code) — the same number the backend enforces.
+3. **Upload + scan.** The filtered zip is POSTed to the backend (with the
+   `X-Access-Key` header when a code is set) and a real byte-level progress bar;
+   once it lands, the backend scans and returns matches.
 4. **Map** (`src/WorldMap.tsx`). Matches are plotted on a single canvas on
    Minecraft's X/Z plane — chunk-aligned grid, drag-to-pan, wheel/pinch zoom,
    auto-fit, hover-for-coordinates.
@@ -260,8 +281,10 @@ done by running the real endpoint against the `testing/` zips.
 - `main.py` — FastAPI app. `POST /parse-blocks` (multipart: `file`, `block_type`,
   `dimension`). Reads only the requested dimension's region members out of the
   spooled upload (no temp dir), then fans `scan_region_bytes` across a
-  `ProcessPoolExecutor` created in the lifespan handler. Server-side 4 GB
-  `Content-Length` guard. CORS open to all origins.
+  `ProcessPoolExecutor` created in the lifespan handler. Tiered `Content-Length`
+  guard (250 MB / 4 GB by `X-Access-Key`) in the `enforce_upload_limit`
+  middleware; a `MAX_CONCURRENT_SCANS` semaphore serializes scans (`503` when
+  busy); CORS origins from `ALLOWED_ORIGINS`. Deploy hardening in `deploy/`.
 - `parser.py` — region-file (`.mca`) sector-table walk and chunk decompression.
   `_walk_region(data, read_external)` is the shared core; `scan_region_bytes`
   (zip/in-memory path, the parallel work unit) and `scan_region_file` (disk path,
@@ -290,8 +313,11 @@ done by running the real endpoint against the `testing/` zips.
    dir (`DIM-1`→nether, `DIM1`→end, else overworld). The worker also preserves
    original arcnames when repacking so the backend re-derives the same dimension.
    Change one, change the other; the backend is the source of truth.
-2. **4 GB limit is enforced in three places** — frontend select, frontend submit,
-   backend `Content-Length`. Keep them consistent.
+2. **Upload limit is tiered (250 MB / 4 GB by access code) and checked on the
+   *uploaded* zip.** Backend `enforce_upload_limit` middleware gates on
+   `Content-Length` by `X-Access-Key`; the frontend mirrors the same numbers on
+   the *filtered* blob and a hard 4 GB ceiling on the original at select time.
+   Keep the frontend tiers in sync with the backend.
 3. **Never load the whole save into memory.** Frontend passes the `File`/Blob by
    reference into the worker; backend reads from Starlette's on-disk spooled file.
 4. **React Compiler is on.** `babel-plugin-react-compiler` + strict
@@ -302,24 +328,29 @@ done by running the real endpoint against the `testing/` zips.
    - Lazy ref init via `if (ref.current == null)`.
    - When cancelling an animation frame on cleanup, **null the ref afterwards** —
      a stale non-null `rafRef` wedges `scheduleDraw` across a StrictMode remount.
-5. **Response shape** is `{ block_type, dimension, count, matches }` where
-   `matches` is `[{ x, y, z }]` (absolute world coords). The map consumes it
-   directly.
+5. **Response shape** is `{ block_type, dimension, count, truncated, matches }`
+   where `matches` is `[{ x, y, z }]` (absolute world coords), capped at 100,000
+   with `truncated` flagging the cap. The map consumes it directly.
 
 ### Known risks / TODO
 
-- **No cap on matches.** A common block (e.g. `stone`) can return millions of
-  coordinates → multi-GB JSON and a canvas/hover-scan that can hang the browser.
-  A result cap + "too many results" message is recommended before exposing
-  arbitrary block types broadly.
-- **Deployment is the remaining work:** Dockerfile (`python:3.13-slim`, arm64) +
-  nginx reverse proxy (`client_max_body_size 4500M`, raised `proxy_read_timeout`,
-  `proxy_request_buffering off`); run uvicorn without `--reload`. Target is Oracle
-  Cloud Always Free, Ampere A1 (arm64).
-- Optional backend perf items (non-blocking): `GZipMiddleware` for large JSON
-  responses; a more compact match serialization; read+scan pipelining.
+- **Untrusted-upload hardening (handled).** A client can POST any zip directly
+  (the browser filter isn't a security boundary), so the backend self-defends:
+  zip-bomb guard (~4 GB total decompressed-bytes cap → `413`), 64 MB per-chunk
+  decompress cap, matches counted but stored only up to 100,000 (`truncated`
+  flag), and per-chunk parse errors skipped instead of crashing. The capped set
+  can still be a heavy canvas/hover-scan; a more compact match serialization is a
+  possible follow-up.
+- **Deployment is the remaining work:** the `Dockerfile` (`python:3.13-slim`,
+  arm64) is still TODO; the nginx reverse-proxy config and the public-deployment
+  checklist now live in `deploy/`. Run uvicorn without `--reload` and as a single
+  process. Target is Oracle Cloud Always Free, Ampere A1 (arm64).
+- `GZipMiddleware` for large JSON responses is enabled. Optional remaining perf
+  items (non-blocking): a more compact match serialization; read+scan pipelining.
 
 ## Status
 
-Single-user personal tool. The app itself is feature-complete; deployment is the
-remaining work. The 4 GB upload ceiling is enforced on both client and server.
+Single-user personal tool, being prepared for limited public use. The app itself
+is feature-complete and hardened for public exposure (tiered upload limit with
+access codes, scan-concurrency gate, configurable CORS, per-IP rate limiting in
+the nginx config); the `Dockerfile` is the remaining deployment work.

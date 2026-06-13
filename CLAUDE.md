@@ -38,7 +38,12 @@ done by running the real endpoint against the `testing/` zips.
   `dimension`). Reads only the requested dimension's region members out of the
   spooled upload (no temp dir), then fans `scan_region_bytes` across a
   `ProcessPoolExecutor` created in the lifespan handler. Server-side 4 GB
-  `Content-Length` guard. CORS open to all origins.
+  `Content-Length` guard. A scan-concurrency semaphore (`MAX_CONCURRENT_SCANS`,
+  default 1, also made in lifespan) serializes heavy scans and returns `503 +
+  Retry-After` when busy, so concurrent uploads can't OOM the box. CORS origins
+  come from `ALLOWED_ORIGINS` (default `*` for dev; set to the frontend origin in
+  prod). Public deploy hardening (per-IP rate/conn limits, body streaming, TLS,
+  single-uvicorn-process rule) lives in `deploy/` (`nginx.conf` + `README.md`).
 - `parser.py` — region-file (`.mca`) sector-table walk and chunk decompression.
   `_walk_region(data, read_external)` is the shared core; `scan_region_bytes`
   (zip/in-memory path, the parallel work unit) and `scan_region_file` (disk path,
@@ -67,8 +72,14 @@ done by running the real endpoint against the `testing/` zips.
    dir (`DIM-1`→nether, `DIM1`→end, else overworld). The worker also preserves
    original arcnames when repacking so the backend re-derives the same dimension.
    Change one, change the other; the backend is the source of truth.
-2. **4 GB limit is enforced in three places** — frontend select, frontend submit,
-   backend `Content-Length`. Keep them consistent.
+2. **Upload limit is tiered and enforced on the *uploaded* (post-filter) zip.**
+   Visitors get `PUBLIC_MAX_UPLOAD_BYTES` (250 MB); a valid `X-Access-Key`
+   (one of `FULL_ACCESS_KEYS`, env) raises it to `FULL_MAX_UPLOAD_BYTES` (4 GB).
+   Enforced in the backend `enforce_upload_limit` middleware (on `Content-Length`,
+   before the body is parsed) and mirrored in the frontend, which checks the
+   *filtered* blob against the same numbers and sends the code header. The
+   frontend's *select*-time check is a separate hard 4 GB ceiling on the original
+   file. Keep the frontend tier numbers (`App.tsx`) in sync with the backend.
 3. **Never load the whole save into memory.** Frontend passes the `File`/Blob by
    reference into the worker; backend reads from Starlette's on-disk spooled file.
 4. **React Compiler is on.** `babel-plugin-react-compiler` + strict
@@ -85,10 +96,13 @@ done by running the real endpoint against the `testing/` zips.
 
 ## Known risks / TODO
 
-- **No cap on matches.** A common block (e.g. `stone`) can return millions of
-  coordinates → multi-GB JSON and a canvas/hover-scan that can hang the browser.
-  A result cap + "too many results" message is recommended before exposing
-  arbitrary block types broadly.
+- **Untrusted-upload hardening (done).** A client can POST any zip to
+  `/parse-blocks` (the browser filter isn't a security boundary), so the backend
+  defends itself: members are read through a ~4 GB total decompressed-bytes cap
+  (`MAX_DECOMPRESSED_REGION_BYTES`, `main.py`) → `413` on a zip bomb; each chunk
+  decompresses under a 64 MB hard cap (`parser.py`); matches are counted but only
+  stored up to `MAX_MATCHES` via `fastnbt.MatchSink` (true `count` kept,
+  `truncated` flagged); per-chunk parse errors are caught and the chunk skipped.
 - **Deployment is the remaining work:** Dockerfile (`python:3.13-slim`, arm64) +
   nginx reverse proxy (`client_max_body_size 4500M`, raised `proxy_read_timeout`,
   `proxy_request_buffering off`); run uvicorn without `--reload`. Target is Oracle

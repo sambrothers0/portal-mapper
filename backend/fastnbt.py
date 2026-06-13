@@ -40,6 +40,29 @@ _u16 = struct.Struct('>H')
 _i32 = struct.Struct('>i')
 
 
+class MatchSink:
+    """Counts matches while retaining at most ``limit`` coordinates.
+
+    A target block like ``stone`` can occur tens of millions of times in one
+    save. Materializing a dict per occurrence would blow up memory long before
+    any response cap applied, so the sink keeps the *true* ``count`` but stops
+    storing coordinates once ``limit`` is reached. The caller reports ``count``
+    and flags truncation when it exceeds the cap.
+    """
+
+    __slots__ = ('limit', 'count', 'matches')
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.count = 0
+        self.matches: list[dict[str, int]] = []
+
+    def add(self, x: int, y: int, z: int) -> None:
+        self.count += 1
+        if len(self.matches) < self.limit:
+            self.matches.append({'x': x, 'y': y, 'z': z})
+
+
 def _skip(buf: bytes, pos: int, tag: int) -> int:
     """Advance ``pos`` past one tag *payload* (no leading id/name) of ``tag``."""
     size = _FIXED_SIZES.get(tag)
@@ -109,7 +132,7 @@ def _emit_block_states(
     base_x: int,
     base_y: int,
     base_z: int,
-    out: list[dict[str, int]],
+    out: MatchSink,
 ) -> None:
     """Scan one section's ``block_states`` compound for the target block."""
     palette_pos = -1
@@ -141,16 +164,15 @@ def _emit_block_states(
     if data_pos < 0:
         if 0 in target_indices:
             for idx in range(4096):
-                out.append(
-                    {
-                        'x': base_x + (idx & 15),
-                        'y': base_y + (idx >> 8),
-                        'z': base_z + ((idx >> 4) & 15),
-                    }
-                )
+                out.add(base_x + (idx & 15), base_y + (idx >> 8), base_z + ((idx >> 4) & 15))
         return
 
     long_count = _i32.unpack_from(buf, data_pos)[0]
+    # A section packs exactly 4096 indices, so the long array is small and
+    # fixed-ish (<=1024 longs). Reject absurd counts from crafted input before
+    # building a huge struct format / read past the buffer.
+    if long_count < 0 or long_count > 4096:
+        return
     longs = struct.unpack_from(f'>{long_count}q', buf, data_pos + 4)
 
     # Modern (>= 1.16) packing keeps every palette index whole within a 64-bit
@@ -166,20 +188,14 @@ def _emit_block_states(
             if idx >= 4096:
                 break
             if (value & mask) in target_indices:
-                out.append(
-                    {
-                        'x': base_x + (idx & 15),
-                        'y': base_y + (idx >> 8),
-                        'z': base_z + ((idx >> 4) & 15),
-                    }
-                )
+                out.add(base_x + (idx & 15), base_y + (idx >> 8), base_z + ((idx >> 4) & 15))
             value >>= bits
             idx += 1
         if idx >= 4096:
             break
 
 
-def _scan_sections(buf: bytes, pos: int, target: str, cx: int, cz: int, out: list[dict[str, int]]) -> None:
+def _scan_sections(buf: bytes, pos: int, target: str, cx: int, cz: int, out: MatchSink) -> None:
     """Walk the ``sections`` list, scanning each section's block states."""
     elem = buf[pos]
     count = _i32.unpack_from(buf, pos + 1)[0]
@@ -214,8 +230,8 @@ def _scan_sections(buf: bytes, pos: int, target: str, cx: int, cz: int, out: lis
             _emit_block_states(buf, block_states_pos, target, base_x, section_y * 16, base_z, out)
 
 
-def scan_chunk(buf: bytes, target: str, out: list[dict[str, int]]) -> None:
-    """Append every ``target``-block coordinate found in one decompressed chunk.
+def scan_chunk(buf: bytes, target: str, out: MatchSink) -> None:
+    """Feed every ``target``-block coordinate found in one decompressed chunk to ``out``.
 
     Silently ignores chunks that are still generating (no ``sections``) or lack
     their position tags, mirroring the "a bad chunk shouldn't sink the save"

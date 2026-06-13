@@ -9,7 +9,7 @@ export type BlockMatch = {
 // The map plots block matches on Minecraft's X/Z plane — the same orientation
 // Chunk Base uses: +X is east (right), +Z is south (down), so north sits at the
 // top. Y (height) is carried only for the hover readout. The whole thing is one
-// canvas: a chunk-aligned grid with signed axis numbers and a glowing pin per
+// canvas: a chunk-aligned grid with signed axis numbers and a white dot per
 // match, pannable by drag and zoomable by wheel.
 
 type View = {
@@ -39,28 +39,6 @@ function niceStep(ppb: number): number {
   return GRID_STEPS[GRID_STEPS.length - 1]
 }
 
-// A soft violet glow baked into an offscreen canvas once, then stamped at every
-// pin with drawImage. Far cheaper than a per-pin shadowBlur, and drawing it with
-// the "lighter" composite op means overlapping pins (a portal's cluster of
-// blocks) bloom brighter — a free density heatmap.
-function makeGlowSprite(): HTMLCanvasElement {
-  const size = 48
-  const sprite = document.createElement('canvas')
-  sprite.width = size
-  sprite.height = size
-  const ctx = sprite.getContext('2d')
-  if (ctx) {
-    const r = size / 2
-    const grad = ctx.createRadialGradient(r, r, 0, r, r, r)
-    grad.addColorStop(0, 'rgba(216, 199, 255, 0.95)')
-    grad.addColorStop(0.25, 'rgba(168, 85, 247, 0.55)')
-    grad.addColorStop(0.6, 'rgba(124, 58, 237, 0.18)')
-    grad.addColorStop(1, 'rgba(124, 58, 237, 0)')
-    ctx.fillStyle = grad
-    ctx.fillRect(0, 0, size, size)
-  }
-  return sprite
-}
 
 type Props = {
   matches: BlockMatch[]
@@ -75,7 +53,6 @@ export function WorldMap({ matches }: Props) {
   const dprRef = useRef(1)
   const matchesRef = useRef<BlockMatch[]>(matches)
   const didFitRef = useRef(false)
-  const spriteRef = useRef<HTMLCanvasElement | null>(null)
   const rafRef = useRef<number | null>(null)
   const dragRef = useRef<{ pointerId: number; lastX: number; lastY: number; lastT: number } | null>(null)
   // Recent pan velocity (screen px / ms) for the release-glide, and the handle
@@ -90,10 +67,6 @@ export function WorldMap({ matches }: Props) {
   const [hovered, setHovered] = useState<Hovered | null>(null)
   const [readout, setReadout] = useState<{ x: number; z: number } | null>(null)
   const [zoomPct, setZoomPct] = useState(50)
-
-  if (spriteRef.current == null) {
-    spriteRef.current = makeGlowSprite()
-  }
 
   // Frame the view on the current matches (or the origin when there are none).
   // Mutates the view ref and reflects the zoom into state; only ever invoked
@@ -198,30 +171,19 @@ export function WorldMap({ matches }: Props) {
       ctx.fillText(String(wz), 6, py + 4)
     }
 
-    // Pins. Glow first with additive blending, then a crisp core on top.
-    const sprite = spriteRef.current
+    // Pins — constant 2.5 px radius regardless of zoom, all batched in one path.
+    const POINT_R = 2.5
     const ms = matchesRef.current
-    const glow = clamp(view.ppb * 6, 14, 64)
-    const core = clamp(view.ppb * 0.55, 1.4, 5)
-    if (sprite) {
-      ctx.globalCompositeOperation = 'lighter'
-      for (const m of ms) {
-        const px = toSx(m.x)
-        const py = toSz(m.z)
-        if (px < -glow || px > w + glow || py < -glow || py > h + glow) continue
-        ctx.drawImage(sprite, px - glow / 2, py - glow / 2, glow, glow)
-      }
-      ctx.globalCompositeOperation = 'source-over'
-    }
-    ctx.fillStyle = 'rgba(233, 224, 255, 0.95)'
+    ctx.fillStyle = 'white'
+    ctx.beginPath()
     for (const m of ms) {
       const px = toSx(m.x)
       const py = toSz(m.z)
-      if (px < -4 || px > w + 4 || py < -4 || py > h + 4) continue
-      ctx.beginPath()
-      ctx.arc(px, py, core, 0, Math.PI * 2)
-      ctx.fill()
+      if (px < -POINT_R || px > w + POINT_R || py < -POINT_R || py > h + POINT_R) continue
+      ctx.moveTo(px + POINT_R, py)
+      ctx.arc(px, py, POINT_R, 0, Math.PI * 2)
     }
+    ctx.fill()
 
     // Highlight the hovered pin with a ring.
     const hov = hoveredRef.current
@@ -229,7 +191,7 @@ export function WorldMap({ matches }: Props) {
       ctx.strokeStyle = 'rgba(233, 224, 255, 0.9)'
       ctx.lineWidth = 1.5
       ctx.beginPath()
-      ctx.arc(toSx(hov.x), toSz(hov.z), Math.max(core + 4, 7), 0, Math.PI * 2)
+      ctx.arc(toSx(hov.x), toSz(hov.z), POINT_R + 4, 0, Math.PI * 2)
       ctx.stroke()
     }
 

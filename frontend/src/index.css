@@ -15,6 +15,27 @@ body,
   min-height: 100%;
 }
 
+/* Hide the browser's own password-reveal / clear controls (Edge & WebKit) — we
+   render our own eye toggle, and the native button otherwise overlaps it and can
+   look like a stray thick edge on the field. */
+input::-ms-reveal,
+input::-ms-clear,
+input::-webkit-credentials-auto-fill-button {
+  display: none;
+}
+
+/* Keep autofilled fields on the dark theme. The default autofill paints a light
+   inset box-shadow that reads as a thick highlighted top edge — pin it to the
+   field's own translucent surface and text colour instead. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #f1f5f9; /* slate-100 */
+  -webkit-box-shadow: 0 0 0 1000px rgba(255, 255, 255, 0.05) inset;
+  caret-color: #f1f5f9;
+  transition: background-color 9999s ease-out 0s;
+}
+
 body {
   margin: 0;
   background: #06040d;

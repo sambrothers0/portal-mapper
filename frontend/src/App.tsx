@@ -8,6 +8,7 @@ type ParseResult = {
   block_type: string
   dimension: string
   count: number
+  truncated: boolean
   matches: BlockMatch[]
 }
 
@@ -25,8 +26,18 @@ type Dimension = (typeof DIMENSIONS)[number]['id']
 const DEFAULT_DIMENSION: Dimension = 'overworld'
 const dimensionLabel = (id: string) => DIMENSIONS.find((d) => d.id === id)?.label ?? id
 
+// Absolute ceiling on the *selected* file — the hard cap nobody can exceed.
 const MAX_FILE_BYTES = 4 * 1024 * 1024 * 1024 // 4 GB
 const MAX_FILE_LABEL = '4 GB'
+
+// Tiered limits on the *uploaded* zip (the browser filters the save to one
+// dimension first, so this is checked on the filtered blob — the same number the
+// backend enforces on Content-Length). Visitors get the public limit; entering a
+// valid access code raises it to the full limit. Mirror of the backend tiers.
+const PUBLIC_UPLOAD_BYTES = 250 * 1024 * 1024 // 250 MB
+const FULL_UPLOAD_BYTES = MAX_FILE_BYTES // 4 GB
+const ACCESS_CODE_STORAGE_KEY = 'portal-mapper-access-code'
+const ACCESS_HEADER = 'X-Access-Key'
 
 // Shown once the upload finishes and the server is grinding through region
 // files. There's no real progress signal from the parse step, so instead of a
@@ -40,7 +51,10 @@ const PROCESSING_MESSAGES = [
   'Charting the spaces in between',
 ]
 
-const formatSize = (bytes: number) => `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+const formatSize = (bytes: number) =>
+  bytes >= 1024 * 1024 * 1024
+    ? `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
+    : `${Math.round(bytes / 1024 / 1024)} MB`
 
 type Phase = 'idle' | 'filtering' | 'uploading' | 'processing'
 
@@ -95,12 +109,16 @@ function filterDimension(
 function postWithUploadProgress(
   url: string,
   form: FormData,
+  accessCode: string,
   onProgress: (percent: number) => void,
   onUploaded: () => void,
 ): Promise<ParseResult> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', url)
+    // Unlocks the larger upload limit server-side. Omitted when blank so visitors
+    // don't send an empty header. It's a soft gate, not real auth.
+    if (accessCode) xhr.setRequestHeader(ACCESS_HEADER, accessCode)
 
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
@@ -147,8 +165,19 @@ function App() {
   // trim-your-world hint instead of a bare "too big" message.
   const [oversize, setOversize] = useState(false)
   const [copied, setCopied] = useState(false)
+  // Optional access code that raises the upload limit. Persisted so trusted users
+  // only enter it once. Set true when a too-large upload is the reason for an
+  // error, to surface the "enter a code" hint instead of the MCA-Selector one.
+  const [accessCode, setAccessCode] = useState(
+    () => localStorage.getItem(ACCESS_CODE_STORAGE_KEY) ?? '',
+  )
+  const [needsAccessCode, setNeedsAccessCode] = useState(false)
+  const [showAccessCode, setShowAccessCode] = useState(false)
 
   const busy = phase !== 'idle'
+  const hasAccessCode = accessCode.trim().length > 0
+  const uploadLimitBytes = hasAccessCode ? FULL_UPLOAD_BYTES : PUBLIC_UPLOAD_BYTES
+  const uploadLimitLabel = hasAccessCode ? '4 GB' : '250 MB'
 
   const copyCoordinates = async () => {
     if (!result) return
@@ -179,10 +208,10 @@ function App() {
   // opacity 0, swap the line once it's faded out, then fade the new line back in.
   // The swap timeout is tracked alongside the interval so both are torn down on
   // cleanup — otherwise a pending swap could fire after the phase has moved on.
+  // The index/visibility are reset where the phase flips to 'processing' (an
+  // event callback), not here — setState in an effect body is disallowed.
   useEffect(() => {
     if (phase !== 'processing') return
-    setMessageIndex(0)
-    setMessageVisible(true)
     let swap: ReturnType<typeof setTimeout> | undefined
     const interval = setInterval(() => {
       setMessageVisible(false)
@@ -215,6 +244,7 @@ function App() {
     setMessageVisible(true)
     setError(null)
     setOversize(false)
+    setNeedsAccessCode(false)
     setCopied(false)
     setResult(null)
 
@@ -223,6 +253,17 @@ function App() {
       // The compress/trim phase drives the bar 0→100, then we reset it so the
       // upload phase tracks bytes sent from zero.
       const filtered = await filterDimension(selectedFile, dimension, setUploadProgress)
+
+      // The limit applies to what actually gets uploaded — the filtered zip — so
+      // we check it here, after compression, with the same number the backend
+      // enforces. Visitors over 250 MB are pointed at the access code.
+      if (filtered.size > uploadLimitBytes) {
+        setError(
+          `The ${dimensionLabel(dimension)} region data is ${formatSize(filtered.size)}, over the ${uploadLimitLabel} upload limit.`,
+        )
+        setNeedsAccessCode(!hasAccessCode)
+        return
+      }
 
       setPhase('uploading')
       setUploadProgress(0)
@@ -234,8 +275,16 @@ function App() {
       const parsed = await postWithUploadProgress(
         API_URL,
         form,
+        accessCode.trim(),
         setUploadProgress,
-        () => setPhase('processing'),
+        () => {
+          // Upload just finished — start the flavor-text rotation from the top as
+          // we enter the processing phase (reset here, in this event callback, so
+          // the effect body stays free of setState).
+          setMessageIndex(0)
+          setMessageVisible(true)
+          setPhase('processing')
+        },
       )
       setResult(parsed)
     } catch (submissionError) {
@@ -295,7 +344,7 @@ function App() {
                 }}
                 className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200 file:mr-4 file:rounded-full file:border-0 file:bg-violet-400/20 file:px-4 file:py-2 file:text-sm file:font-medium file:text-violet-100 hover:bg-white/7"
               />
-              <span className="text-xs text-slate-500">Zipped save folder · up to {MAX_FILE_LABEL}</span>
+              <span className="text-xs text-slate-500">Zipped save folder · up to {uploadLimitLabel}</span>
             </label>
 
             <label className="grid gap-2 text-left">
@@ -337,6 +386,72 @@ function App() {
                 })}
               </div>
             </div>
+
+            {/* Optional access code — unlocks the larger upload limit. Stored
+                locally so trusted users only ever type it once. */}
+            <label className="grid gap-2 text-left">
+              <span className="text-xs font-medium uppercase tracking-[0.35em] text-violet-200/70">
+                Access code{' '}
+                <span className="lowercase tracking-normal text-slate-500">(optional)</span>
+              </span>
+              <div className="relative">
+                <input
+                  type={showAccessCode ? 'text' : 'password'}
+                  value={accessCode}
+                  autoComplete="off"
+                  disabled={busy}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    setAccessCode(value)
+                    setNeedsAccessCode(false)
+                    if (value.trim()) localStorage.setItem(ACCESS_CODE_STORAGE_KEY, value)
+                    else localStorage.removeItem(ACCESS_CODE_STORAGE_KEY)
+                  }}
+                  placeholder="Raises your upload limit to 4 GB"
+                  className="w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 pr-12 text-sm text-slate-100 outline-none placeholder:text-slate-500 focus:border-violet-300/40 disabled:opacity-60"
+                />
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setShowAccessCode((shown) => !shown)}
+                  aria-label={showAccessCode ? 'Hide access code' : 'Show access code'}
+                  aria-pressed={showAccessCode}
+                  className="absolute inset-y-0 right-0 flex items-center px-4 text-slate-400 transition hover:text-violet-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {showAccessCode ? (
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M9.88 9.88a3 3 0 1 0 4.24 4.24" />
+                      <path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68" />
+                      <path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61" />
+                      <line x1="2" x2="22" y1="2" y2="22" />
+                    </svg>
+                  ) : (
+                    <svg
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={2}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      className="h-4 w-4"
+                      aria-hidden="true"
+                    >
+                      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+                      <circle cx="12" cy="12" r="3" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+            </label>
 
             <button
               type="button"
@@ -412,6 +527,21 @@ function App() {
           {error ? (
             <div className="mt-5 rounded-2xl border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm text-red-100">
               <p>{error}</p>
+              {needsAccessCode ? (
+                <p className="mt-2 text-red-100/80">
+                  Have an access code? Enter it above to upload worlds up to 4 GB. Otherwise, trim
+                  the world down with{' '}
+                  <a
+                    href="https://github.com/Querz/mcaselector"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline underline-offset-2 hover:text-white"
+                  >
+                    MCA Selector
+                  </a>
+                  .
+                </p>
+              ) : null}
               {oversize ? (
                 <p className="mt-2 text-red-100/80">
                   Too large to upload? Trim away unexplored chunks with{' '}
@@ -433,22 +563,31 @@ function App() {
             <div className="mt-6">
               <div className="rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-slate-200">
                 <p>
-                  Found {result.count} matching blocks for{' '}
+                  Found {result.count.toLocaleString()} matching blocks for{' '}
                   <span className="text-violet-200">{result.block_type}</span> in the{' '}
                   <span className="text-violet-200">{dimensionLabel(result.dimension)}</span>.
                 </p>
+                {result.truncated ? (
+                  <p className="mt-2 text-xs text-amber-200/80">
+                    The world holds more than the map can carry — only the first 100,000 are shown. Try a rarer block for a complete reading.
+                  </p>
+                ) : null}
                 {result.count > 0 ? (
                   <button
                     type="button"
                     onClick={copyCoordinates}
                     className="mt-3 inline-flex items-center gap-2 rounded-full border border-violet-300/20 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-100 transition hover:bg-violet-400/20"
                   >
-                    {copied ? 'Copied' : 'Copy coordinates as JSON'}
+                    {copied
+                      ? 'Copied'
+                      : result.truncated
+                        ? 'Copy first 100,000 coordinates as JSON'
+                        : 'Copy coordinates as JSON'}
                   </button>
                 ) : null}
               </div>
             </div>
-          ) : (null)}
+          ) : null}
         </section>
       </div>
 
