@@ -448,11 +448,7 @@ function App() {
                 ) : null}
               </div>
             </div>
-          ) : (
-            <p className="mt-6 text-sm leading-7 text-slate-300">
-              Upload a zipped save folder, enter a block ID, and the results will appear here.
-            </p>
-          )}
+          ) : (null)}
         </section>
       </div>
 
