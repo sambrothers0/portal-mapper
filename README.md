@@ -235,6 +235,16 @@ npm run preview  # preview the production build locally
 npm run lint     # run ESLint
 ```
 
+### Deployment (GitHub Pages)
+
+The frontend is a static bundle deployed to GitHub Pages by
+[`.github/workflows/deploy-frontend.yml`](.github/workflows/deploy-frontend.yml):
+every push to `master` touching `frontend/**` rebuilds and publishes
+`frontend/dist` to `https://sambrothers0.github.io/portal-mapper/`. One-time
+setup (Pages source = "GitHub Actions"; an Actions variable `VITE_API_URL`
+pointing at the deployed backend) and the base-path / CORS / HTTPS details are in
+the [frontend README](frontend/README.md#deploying-to-github-pages).
+
 ### How it works
 
 1. **Pick a save + dimension.** The selected `.zip` is validated against the
@@ -353,4 +363,6 @@ done by running the real endpoint against the `testing/` zips.
 Single-user personal tool, being prepared for limited public use. The app itself
 is feature-complete and hardened for public exposure (tiered upload limit with
 access codes, scan-concurrency gate, configurable CORS, per-IP rate limiting in
-the nginx config); the `Dockerfile` is the remaining deployment work.
+the nginx config). The frontend auto-deploys to GitHub Pages (see
+[Deployment](#deployment-github-pages)); the backend `Dockerfile` for the Oracle
+A1 host is the remaining deployment work.

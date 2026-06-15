@@ -41,6 +41,41 @@ npm run preview  # preview the production build locally
 npm run lint     # run ESLint
 ```
 
+## Deploying to GitHub Pages
+
+The frontend is a static bundle, so it's hosted on GitHub Pages and redeployed
+automatically. The workflow is
+[`.github/workflows/deploy-frontend.yml`](../.github/workflows/deploy-frontend.yml):
+on every push to `master` that touches `frontend/**`, it runs `npm ci` +
+`npm run build` and publishes `frontend/dist`. Live URL:
+`https://sambrothers0.github.io/portal-mapper/`. (Trigger it manually any time
+from the Actions tab via **Run workflow**.)
+
+**One-time setup (in the GitHub repo):**
+
+1. **Settings → Pages → Build and deployment → Source: "GitHub Actions".**
+   (Not the older "Deploy from a branch" mode.)
+2. **Settings → Secrets and variables → Actions → Variables →** add a repository
+   *variable* (not a secret) named `VITE_API_URL` pointing at the deployed
+   backend, e.g. `https://your-backend-host/parse-blocks`. If it's left unset the
+   build still succeeds but the bundle falls back to
+   `http://localhost:8000/parse-blocks`, so the live site can't reach a backend
+   until this is set and the workflow re-runs.
+
+**Two build-time details that make Pages work:**
+
+- **Base path.** A project site is served from a subpath
+  (`/portal-mapper/`), so all asset URLs must be prefixed with it. The workflow
+  sets `VITE_BASE=/portal-mapper/`, which `vite.config.ts` reads into Vite's
+  `base`. Local dev and a plain `npm run build` default to `/`, so nothing
+  changes locally. **If the repo is ever renamed, update `VITE_BASE` in the
+  workflow to match** (or it 404s on assets).
+- **Backend URL is compiled in.** `VITE_API_URL` is read at *build* time, so
+  changing the backend address means re-running the workflow, not just editing a
+  setting. The backend must also (a) allow this Pages origin via
+  `ALLOWED_ORIGINS`, and (b) be served over **HTTPS** — Pages is HTTPS-only, and
+  a browser blocks an HTTPS page from calling an HTTP API (mixed content).
+
 ## How it works
 
 1. **Pick a save + dimension.** The selected `.zip` is validated against the
