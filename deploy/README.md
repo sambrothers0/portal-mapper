@@ -72,38 +72,54 @@ The frontend is a static `dist/` build. Two options:
    `VITE_API_URL`. The Oracle box then only ever serves the one rate-limited,
    concurrency-gated endpoint. Set `ALLOWED_ORIGINS` to the Pages domain.
 
-## Landing the A1 (run the grabber on the micro, not your home PC)
+## Landing the A1 (two stages: grab 1 OCPU, then resize to 2 OCPU on the box)
 
-The Always Free **Ampere A1** (2 OCPU / 12 GB ARM — this is the box that actually
-runs the backend) is usually out of capacity, so grabbing it means polling for
-hours/days. Don't tie up your home PC: grab the trivially-available **E2.1.Micro**
-first (1/8 OCPU, 1 GB, x86 — `grab-micro.ps1`), then run the A1 grabber *on the
-micro* 24/7. The grabber is just `oci` CLI calls + sleeps (~150 MB peak), so 1 GB
-is plenty, and the constant polling keeps the micro itself out of reclamation.
+The Always Free **Ampere A1** allowance (2 OCPU / 12 GB ARM — this is the box
+that runs the backend) is usually out of capacity, so grabbing it outright means
+polling for hours/days. Two stages get you there without tying up your home PC
+and without a throwaway micro box:
 
-- `grab-micro.ps1` / `grab-a1.ps1` — Windows (run from your PC to bootstrap).
-- `grab-a1.sh` + `grab-a1.service` — the **Linux port**, to run on the micro.
+1. **Grab a 1-OCPU / 6 GB A1 from your PC** (`grab-a1.ps1`). A smaller slice
+   lands far more often than the full 2 OCPU on contended free capacity, and
+   6 GB already runs the backend. This is your always-on box.
+2. **Resize it to 2 OCPU / 12 GB from the box itself** (`grab-a1.sh` under
+   `grab-a1.service`). It can't *launch* a second 2-OCPU box — the tenancy cap is
+   2 OCPU total, so 1 + 2 > 2 → `LimitExceeded`. Instead it resizes this instance
+   up *in place*, retrying 24/7 until capacity frees up.
 
-On the micro (one-time setup):
+   **Why retrying can't lose you the box:** a flex OCPU change applies via an
+   automatic reboot, and OCI validates capacity up front — if 2 OCPU isn't free
+   the resize call is rejected immediately and the box keeps running, untouched,
+   at 1 OCPU. Only a *successful* resize reboots it (briefly) into 2 OCPU. (Edge
+   case: if a resize ever left the box stopped, the on-box script can't restart
+   it — start it once from the console and it resumes from there.)
+
+Files:
+
+- `grab-a1.ps1` — Windows, Stage 1 (run from your PC to land the 1-OCPU box).
+- `grab-a1.sh` + `grab-a1.service` — Linux, Stage 2 (runs on the A1, resizes up).
+
+On the A1 box, after Stage 1 (one-time setup):
 
 ```bash
 # 1. install the OCI CLI, then configure an api_key profile named API_KEY
 #    (session auth needs a browser, so it can't work headless — api_key is required)
 oci setup config            # create ~/.oci/config, profile name: API_KEY
-# 2. put your instance SSH pubkey where the script expects it
-cp portal-mapper-oracle.pub ~/.ssh/
-# 3. clone the repo, then run the grabber under systemd so it survives reboots
+#    ...and add an IAM policy allowing this user to manage the instance.
+# 2. clone the repo, then run the upgrader under systemd so it survives reboots
 sudo cp deploy/grab-a1.service /etc/systemd/system/
 #    edit ExecStart path/user in the unit; optionally set NTFY_TOPIC for a phone push
 sudo systemctl daemon-reload
 sudo systemctl enable --now grab-a1
-journalctl -u grab-a1 -f    # watch the sweeps; "SUCCESS" when the A1 lands
+journalctl -u grab-a1 -f    # watch the attempts; "RESIZE ACCEPTED" when 2 OCPU lands
 ```
 
-The grabber exits cleanly the moment the A1 is launched (and writes
-`~/oci-a1-SUCCESS.json`); the unit treats success / limit-hit / auth-fail as
-"done" and won't restart, but self-heals across network blips and reboots. Once
-the A1 is up, deploy the backend there and start `keepalive.py` on it (below).
+When the resize is accepted the script writes `~/oci-a1-SUCCESS.json` and the box
+reboots into 2 OCPU; the unit re-runs on boot, sees it's already at 2 OCPU, and
+exits cleanly (idempotent). It treats success / limit-hit / auth-fail as "done"
+and won't restart on those, but self-heals across network blips and reboots.
+Deploy the backend on this box and start `keepalive.py` on it (below) — both
+stages aside, the box serves traffic the whole time.
 
 ## Keeping the A1 alive (idle-reclamation guard)
 

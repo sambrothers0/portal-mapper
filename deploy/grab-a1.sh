@@ -1,44 +1,66 @@
 #!/usr/bin/env bash
 #
-# Linux port of grab-a1.ps1 — run this ON the always-free E2.1.Micro so it hunts
-# the Ampere A1 (VM.Standard.A1.Flex) 24/7 without leaving your home PC on.
-# Rotates all 3 ADs each sweep; stops on success or resource-limit; auto-backs-off
-# on 429. Headless: no balloon popups — it logs, drops a SUCCESS marker file, and
-# (optionally) pushes a phone notification via ntfy.
+# Upgrade the Always-Free Ampere A1 from 1 OCPU / 6 GB to 2 OCPU / 12 GB
+# IN PLACE. Runs ON the A1 box itself (this replaces the old micro-hosted
+# launch grabber — there is no micro anymore).
 #
-# Why this runs fine on the tiny micro: it's just `oci` CLI calls + sleeps. One
-# launch attempt every ~3s, ~150 MB peak per CLI invocation — trivial on 1 GB.
-# While it runs it keeps the micro busy (network), so the micro itself can't trip
-# idle reclamation; once the A1 is up, move the backend + keepalive.py to the A1.
+# Why a resize, not a launch:
+#   We already hold a 1-OCPU A1 (the always-on box, landed by grab-a1.ps1 from
+#   your PC). The Always-Free A1 cap is 2 OCPU / 12 GB *total* per tenancy, so
+#   LAUNCHing a second 2-OCPU instance would always return LimitExceeded
+#   (1 + 2 = 3 > 2). Instead we resize THIS instance up to the full allowance.
 #
-# Prereqs on the micro (see deploy/README.md):
+# Why this is safe to retry 24/7 (won't lose you the box):
+#   A flex-shape OCPU change is applied via an automatic reboot, and OCI checks
+#   capacity UP FRONT. If 2-OCPU capacity isn't free, the `instance update` call
+#   is rejected immediately and the box keeps running, untouched, at 1 OCPU — so
+#   a failed attempt is just one rejected API call, no stop, no downtime. Only a
+#   SUCCESSFUL attempt reboots the box (briefly) into 2 OCPU. The lone caveat:
+#   if a resize were ever to leave the box stopped, this on-box script can't
+#   restart it — start it once from the console and it self-heals from there.
+#
+# Lifecycle:
+#   - We self-identify via the instance metadata endpoint (no hardcoded OCID).
+#   - If we're already at >=2 OCPU, we're done (write SUCCESS marker, exit 0).
+#   - On a successful resize the box reboots; the systemd unit re-runs us on
+#     boot, we see 2 OCPU via metadata, and finish. Idempotent across reboots.
+#
+# Prereqs on the A1 box (see deploy/README.md):
 #   1. oci CLI installed and on PATH
 #   2. ~/.oci/config with an api_key profile named API_KEY (session auth needs a
 #      browser, so it's not usable headless — api_key is required here)
-#   3. your instance SSH pubkey at ~/.ssh/portal-mapper-oracle.pub
+#   3. an IAM policy letting this user manage the instance in its compartment
 #
 # Usage:   ./grab-a1.sh                 # foreground
 #          systemctl enable --now grab-a1   # 24/7 via deploy/grab-a1.service
 # Log:     ~/oci-a1.log   (also stdout / journalctl)
 #
-# Every tenancy/region value below can be overridden by an env var of the same
-# name; the defaults match grab-a1.ps1 (same tenancy, us-ashburn-1).
+# Every value below can be overridden by an env var of the same name.
 
 set -uo pipefail
 
 OCI="${OCI:-oci}"
 AUTH_PROFILE="${AUTH_PROFILE:-API_KEY}"
-COMPARTMENT="${COMPARTMENT:-ocid1.tenancy.oc1..aaaaaaaana5ot43k5qutlhxxwybavgy45snzgmisruhn4h7hatzlfret6zwq}"
-SUBNET="${SUBNET:-ocid1.subnet.oc1.iad.aaaaaaaa2zgjdq6z5zp5vc7hompzpcafdxxs5sduxdrzkqfzcsdwdst6775a}"
-IMAGE="${IMAGE:-ocid1.image.oc1.iad.aaaaaaaahpg6oykrd3js4ow727r4xleo6lryb4pmnexpi6cxpncff6kv2skq}"  # OL9 aarch64
-SSH_PUB="${SSH_PUB:-$HOME/.ssh/portal-mapper-oracle.pub}"
 DISPLAY_NAME="${DISPLAY_NAME:-portal-mapper}"
 
-# All 3 Ashburn ADs (same tenancy prefix as grab-a1.ps1).
-ADS=("fivK:US-ASHBURN-AD-1" "fivK:US-ASHBURN-AD-2" "fivK:US-ASHBURN-AD-3")
+# Instance metadata service (IMDSv2 needs the Bearer header). Used to learn our
+# own OCID and current OCPU count without baking anything in. Override
+# INSTANCE_ID to target a different box (e.g. when testing from elsewhere).
+IMDS="${IMDS:-http://169.254.169.254/opc/v2}"
+imds() { curl -fsS -H 'Authorization: Bearer Oracle' "$IMDS/$1"; }
 
-AD_PAUSE="${AD_PAUSE:-2}"        # seconds between individual AD launch calls
-WAIT_SEC="${WAIT_SEC:-3}"        # seconds between full AD sweeps
+INSTANCE_ID="${INSTANCE_ID:-$(imds instance/id || true)}"
+
+# Target shape: the full Always-Free A1 allowance. As of 2026-06-15 this is the
+# 2 OCPU / 12 GB tenancy cap; asking for more returns LimitExceeded.
+SHAPE="${SHAPE:-VM.Standard.A1.Flex}"
+SHAPE_OCPUS="${SHAPE_OCPUS:-2}"
+SHAPE_MEM_GB="${SHAPE_MEM_GB:-12}"
+shape_cfg="$(mktemp "${TMPDIR:-/tmp}/oci-shape-cfg.XXXXXX.json")"
+printf '{"ocpus": %s, "memoryInGBs": %s}' "$SHAPE_OCPUS" "$SHAPE_MEM_GB" > "$shape_cfg"
+trap 'rm -f "$shape_cfg"' EXIT
+
+WAIT_SEC="${WAIT_SEC:-30}"        # seconds between resize attempts
 # Throttle-backoff safety net: on 429 we slow down (30 -> 60 -> 120, cap 300s)
 # and reset once the API clears, so a burst can't escalate into API abuse.
 THROTTLE_BASE="${THROTTLE_BASE:-30}"
@@ -48,16 +70,8 @@ throttle_sleep="$THROTTLE_BASE"
 LOG="${LOG:-$HOME/oci-a1.log}"
 SUCCESS_FILE="${SUCCESS_FILE:-$HOME/oci-a1-SUCCESS.json}"
 # Optional phone push on success: set NTFY_TOPIC (https://ntfy.sh, no signup) to
-# get pinged when the A1 lands. Unset = silent (the marker file is always written).
+# get pinged when the box reaches 2 OCPU. Unset = silent (marker still written).
 NTFY_TOPIC="${NTFY_TOPIC:-}"
-
-# As of 2026-06-15 the Always Free A1 allocation was cut from 4 OCPU / 24 GB to
-# 2 OCPU / 12 GB total per tenancy. Requesting more now returns LimitExceeded.
-SHAPE_OCPUS="${SHAPE_OCPUS:-2}"
-SHAPE_MEM_GB="${SHAPE_MEM_GB:-12}"
-shape_cfg="$(mktemp "${TMPDIR:-/tmp}/oci-shape-cfg.XXXXXX.json")"
-printf '{"ocpus": %s, "memoryInGBs": %s}' "$SHAPE_OCPUS" "$SHAPE_MEM_GB" > "$shape_cfg"
-trap 'rm -f "$shape_cfg"' EXIT
 
 log() {
     local line
@@ -71,68 +85,85 @@ notify() {
     curl -fsS -H "Title: $1" -d "$2" "https://ntfy.sh/${NTFY_TOPIC}" >/dev/null 2>&1 || true
 }
 
-log "=== A1 grab started - OL9 aarch64, ${SHAPE_OCPUS} OCPU / ${SHAPE_MEM_GB} GB, ~${AD_PAUSE}s/AD + ${WAIT_SEC}s/sweep, auto-backoff on throttle ==="
+# Integer OCPU count from metadata (e.g. "1.0" -> 1). Empty/unknown -> 0.
+current_ocpus() {
+    local o
+    o="$(imds instance/shapeConfig/ocpus 2>/dev/null || true)"
+    printf '%s' "${o%%.*}" | grep -Eo '^[0-9]+' || printf '0'
+}
 
-n=0       # full-sweep counter
-tries=0   # individual launch-call counter
+if [ -z "$INSTANCE_ID" ]; then
+    log "ERROR - could not determine this instance's OCID (metadata at $IMDS)."
+    log "Run on the A1 box, or set INSTANCE_ID=<ocid> to target one explicitly."
+    exit 4
+fi
+
+log "=== A1 upgrade started - resize $INSTANCE_ID -> ${SHAPE_OCPUS} OCPU / ${SHAPE_MEM_GB} GB, retry ${WAIT_SEC}s, auto-backoff on throttle ==="
+
+# Already at (or above) target? Nothing to do — record and stop.
+have="$(current_ocpus)"
+if [ "$have" -ge "$SHAPE_OCPUS" ]; then
+    log "Already at ${have} OCPU (>= target ${SHAPE_OCPUS}) - nothing to do."
+    [ -f "$SUCCESS_FILE" ] || printf '{"instance":"%s","ocpus":%s}\n' "$INSTANCE_ID" "$have" > "$SUCCESS_FILE"
+    exit 0
+fi
+
+tries=0
 while true; do
-    n=$((n + 1))
-    for ad in "${ADS[@]}"; do
-        tries=$((tries + 1))
-        log "Sweep $n / try $tries - $ad"
+    tries=$((tries + 1))
+    log "Attempt $tries - resize to ${SHAPE_OCPUS} OCPU / ${SHAPE_MEM_GB} GB"
 
-        out="$("$OCI" compute instance launch \
-            --compartment-id           "$COMPARTMENT" \
-            --availability-domain      "$ad" \
-            --shape                    "VM.Standard.A1.Flex" \
-            --shape-config             "file://$shape_cfg" \
-            --image-id                 "$IMAGE" \
-            --subnet-id                "$SUBNET" \
-            --ssh-authorized-keys-file "$SSH_PUB" \
-            --display-name             "$DISPLAY_NAME" \
-            --assign-public-ip         true \
-            --auth                     api_key \
-            --profile                  "$AUTH_PROFILE" \
-            --output                   json 2>&1)"
-        code=$?
+    # --no-retry: an under-capacity resize returns HTTP 500, which the OCI SDK
+    # would otherwise retry internally with backoff (~100s/call), throttling our
+    # own loop. With it off each call returns in ~3s and WAIT_SEC drives the pace;
+    # real 429s are caught by the throttle-backoff branch below.
+    out="$("$OCI" compute instance update \
+        --instance-id    "$INSTANCE_ID" \
+        --shape          "$SHAPE" \
+        --shape-config   "file://$shape_cfg" \
+        --force \
+        --no-retry \
+        --auth           api_key \
+        --profile        "$AUTH_PROFILE" \
+        --output         json 2>&1)"
+    code=$?
 
-        if [ "$code" -eq 0 ] && printf '%s' "$out" | grep -q '"id": *"ocid1\.instance'; then
-            log "SUCCESS in $ad after $tries tries ($n sweeps)"
-            log "$out"
-            printf '%s\n' "$out" > "$SUCCESS_FILE"
-            notify "OCI A1 is UP!" "Instance launched in $ad - open console. Saved to $SUCCESS_FILE"
-            exit 0
+    if [ "$code" -eq 0 ]; then
+        # Resize accepted -> OCI will reboot the box to apply. We'll likely be
+        # killed mid-reboot; the systemd unit re-runs us on boot and confirms
+        # 2 OCPU via metadata. Write the marker now so the win is recorded.
+        log "RESIZE ACCEPTED after $tries tries - box will reboot into ${SHAPE_OCPUS} OCPU"
+        printf '%s\n' "$out" > "$SUCCESS_FILE"
+        notify "OCI A1 upgraded!" "Resized to ${SHAPE_OCPUS} OCPU / ${SHAPE_MEM_GB} GB - rebooting to apply."
+        exit 0
 
-        elif printf '%s' "$out" | grep -Eq 'NotAuthenticated|token.*expired|security token|401'; then
-            log "AUTH FAILED - check ~/.oci/config api_key profile '$AUTH_PROFILE'"
-            notify "OCI auth failed" "grab-a1 on the micro can't authenticate; fix ~/.oci/config."
-            exit 2
+    elif printf '%s' "$out" | grep -Eq 'NotAuthenticated|NotAuthorized|token.*expired|security token|"status":[[:space:]]*401'; then
+        log "AUTH FAILED - check ~/.oci/config api_key profile '$AUTH_PROFILE'"
+        notify "OCI auth failed" "grab-a1 on the A1 box can't authenticate; fix ~/.oci/config."
+        exit 2
 
-        elif printf '%s' "$out" | grep -q 'LimitExceeded'; then
-            log "RESOURCE LIMIT EXCEEDED - you may already have an A1 instance"
-            notify "OCI limit exceeded" "Check your console - resource limit hit."
-            exit 3
+    elif printf '%s' "$out" | grep -q 'LimitExceeded'; then
+        log "RESOURCE LIMIT EXCEEDED - tenancy can't grant ${SHAPE_OCPUS} OCPU (already using A1 capacity elsewhere?)"
+        notify "OCI limit exceeded" "Resize to ${SHAPE_OCPUS} OCPU hit the A1 cap - check your console."
+        exit 3
 
-        elif printf '%s' "$out" | grep -Eq 'TooManyRequests|429|throttl'; then
-            # OCI is rate-limiting us - back off (exponential, capped) and reset
-            # the cadence so we don't keep poking an angry API.
-            log "  THROTTLED (429) - backing off ${throttle_sleep}s"
-            sleep "$throttle_sleep"
-            throttle_sleep=$(( throttle_sleep * 2 ))
-            [ "$throttle_sleep" -gt "$THROTTLE_CAP" ] && throttle_sleep="$THROTTLE_CAP"
-            continue   # skip the normal inter-AD pause; backoff already covered it
+    elif printf '%s' "$out" | grep -Eq 'TooManyRequests|throttl|"status":[[:space:]]*429'; then
+        # OCI is rate-limiting us - back off (exponential, capped) and reset
+        # the cadence so we don't keep poking an angry API.
+        log "  THROTTLED (429) - backing off ${throttle_sleep}s"
+        sleep "$throttle_sleep"
+        throttle_sleep=$(( throttle_sleep * 2 ))
+        [ "$throttle_sleep" -gt "$THROTTLE_CAP" ] && throttle_sleep="$THROTTLE_CAP"
+        continue   # skip the normal wait; backoff already covered it
 
-        else
-            # InternalError / out-of-capacity - expected, keep rotating.
-            throttle_sleep="$THROTTLE_BASE"   # clean response: clear any backoff
-            snippet="$(printf '%s' "$out" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
-            [ "${#snippet}" -gt 120 ] && snippet="${snippet:0:120}..."
-            log "  No capacity (exit $code): $snippet"
-        fi
+    else
+        # Out of host capacity / InternalError - expected while 2-OCPU A1 is
+        # contended. The box is untouched (still running at 1 OCPU); just retry.
+        throttle_sleep="$THROTTLE_BASE"   # clean response: clear any backoff
+        snippet="$(printf '%s' "$out" | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')"
+        [ "${#snippet}" -gt 120 ] && snippet="${snippet:0:120}..."
+        log "  No capacity (exit $code): $snippet"
+    fi
 
-        sleep "$AD_PAUSE"   # brief pause between ADs
-    done
-
-    log "All ADs full - sleeping ${WAIT_SEC}s..."
     sleep "$WAIT_SEC"
 done
