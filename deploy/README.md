@@ -26,9 +26,9 @@ gets the whole process pool and runs at full speed.
 # Lock CORS to the deployed frontend's exact origin (comma-separated for more).
 ALLOWED_ORIGINS=https://your-frontend-domain
 
-# Concurrent scans. Keep at 1 on the 4-core A1: one scan gets all cores (fastest
-# completion) and the box can never be pushed into swap by parallel big uploads.
-# Raise only on a bigger host with RAM headroom (~4 GB resident per scan).
+# Concurrent scans. Keep at 1 on the 2-OCPU / 12 GB A1: one scan gets both cores
+# (fastest completion) and the box can never be pushed into swap by parallel big
+# uploads. Raise only on a bigger host with RAM headroom (~4 GB resident per scan).
 MAX_CONCURRENT_SCANS=1
 
 # Access codes that unlock the 4 GB upload limit (visitors are capped at 250 MB).
@@ -52,7 +52,7 @@ FULL_ACCESS_KEYS=your-private-code,a-code-for-a-friend
 
 The app shares a single `ProcessPoolExecutor` sized to `os.cpu_count()`. Running
 uvicorn with `--workers N` would give each worker its **own** pool →
-`N × cpu_count` processes fighting over 4 cores. Run exactly one uvicorn process
+`N × cpu_count` processes fighting over the 2 cores. Run exactly one uvicorn process
 and let the pool provide the parallelism. No `--reload` in prod.
 
 ```bash
@@ -71,6 +71,64 @@ The frontend is a static `dist/` build. Two options:
    Pages / Netlify (free, global CDN, free TLS) and point it at the backend via
    `VITE_API_URL`. The Oracle box then only ever serves the one rate-limited,
    concurrency-gated endpoint. Set `ALLOWED_ORIGINS` to the Pages domain.
+
+## Landing the A1 (run the grabber on the micro, not your home PC)
+
+The Always Free **Ampere A1** (2 OCPU / 12 GB ARM — this is the box that actually
+runs the backend) is usually out of capacity, so grabbing it means polling for
+hours/days. Don't tie up your home PC: grab the trivially-available **E2.1.Micro**
+first (1/8 OCPU, 1 GB, x86 — `grab-micro.ps1`), then run the A1 grabber *on the
+micro* 24/7. The grabber is just `oci` CLI calls + sleeps (~150 MB peak), so 1 GB
+is plenty, and the constant polling keeps the micro itself out of reclamation.
+
+- `grab-micro.ps1` / `grab-a1.ps1` — Windows (run from your PC to bootstrap).
+- `grab-a1.sh` + `grab-a1.service` — the **Linux port**, to run on the micro.
+
+On the micro (one-time setup):
+
+```bash
+# 1. install the OCI CLI, then configure an api_key profile named API_KEY
+#    (session auth needs a browser, so it can't work headless — api_key is required)
+oci setup config            # create ~/.oci/config, profile name: API_KEY
+# 2. put your instance SSH pubkey where the script expects it
+cp portal-mapper-oracle.pub ~/.ssh/
+# 3. clone the repo, then run the grabber under systemd so it survives reboots
+sudo cp deploy/grab-a1.service /etc/systemd/system/
+#    edit ExecStart path/user in the unit; optionally set NTFY_TOPIC for a phone push
+sudo systemctl daemon-reload
+sudo systemctl enable --now grab-a1
+journalctl -u grab-a1 -f    # watch the sweeps; "SUCCESS" when the A1 lands
+```
+
+The grabber exits cleanly the moment the A1 is launched (and writes
+`~/oci-a1-SUCCESS.json`); the unit treats success / limit-hit / auth-fail as
+"done" and won't restart, but self-heals across network blips and reboots. Once
+the A1 is up, deploy the backend there and start `keepalive.py` on it (below).
+
+## Keeping the A1 alive (idle-reclamation guard)
+
+Oracle may **reclaim** an Always Free instance that stays idle for a rolling
+7-day window — but only if 95th-percentile CPU **and** network **and** memory
+utilization are *all* under ~20% the whole time. It's an AND, so holding any one
+metric above the line is enough. `keepalive.py` holds the cheapest one: it parks
+3 GiB of RAM resident (~30% of the 12 GB A1) at ~0% CPU, instead of burning the
+free box with a fake-traffic or CPU-spin loop. This is a slow 7-day reclaim, not
+a per-request spin-down — once running, the box answers every request instantly.
+
+```bash
+sudo cp deploy/keepalive.service /etc/systemd/system/
+# edit ExecStart path in the unit if the repo isn't at /opt/portal-mapper
+sudo systemctl daemon-reload
+sudo systemctl enable --now keepalive
+journalctl -u keepalive -f          # confirm "resident: … pages held"
+```
+
+Tunables (env, set in the unit): `KEEPALIVE_MB` (default 3072 — the held MiB;
+3 GiB clears the 2.4 GB / 20% line with margin and still leaves ~8.5 GB for a
+scan) and `KEEPALIVE_INTERVAL_SEC` (default 300 — re-touch cadence). The unit
+sets `OOMScoreAdjust=900` so if a real scan ever needs the RAM, the kernel kills
+the keepalive first and systemd restarts it afterward — the backend is never the
+casualty.
 
 ## Host / network checklist
 

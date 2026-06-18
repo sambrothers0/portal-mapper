@@ -1,0 +1,29 @@
+[Unit]
+Description=portal-mapper Oracle A1 idle-reclamation keepalive (RAM parker)
+Documentation=https://github.com/your/repo/blob/master/deploy/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Adjust the path to wherever the repo is checked out on the host.
+ExecStart=/usr/bin/python3 /opt/portal-mapper/deploy/keepalive.py
+Environment=KEEPALIVE_MB=3072
+Environment=KEEPALIVE_INTERVAL_SEC=300
+
+# This process is disposable: if a real scan needs the RAM, the kernel OOM-killer
+# should take the keepalive FIRST, never the backend. systemd restarts it after.
+OOMScoreAdjust=900
+Nice=19
+
+Restart=always
+RestartSec=10
+
+# Run unprivileged; it needs nothing but memory.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

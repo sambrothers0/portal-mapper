@@ -1,0 +1,26 @@
+[Unit]
+Description=portal-mapper A1 grabber (runs on the E2.1.Micro, hunts the Ampere A1 24/7)
+Documentation=https://github.com/your/repo/blob/master/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust path/user to wherever you put the repo on the micro.
+ExecStart=/home/opc/portal-mapper/deploy/grab-a1.sh
+# Optional: phone push when the A1 lands (https://ntfy.sh, no signup).
+# Environment=NTFY_TOPIC=your-secret-topic
+
+# The script loops forever internally and exits only on terminal outcomes:
+#   0 = A1 grabbed   2 = auth broken   3 = limit hit (you already have one)
+# Treat all three as "done, do NOT restart"; restart only if it dies unexpectedly
+# (network drop, OOM, killed) so it self-heals across blips and reboots.
+SuccessExitStatus=0 2 3
+RestartPreventExitStatus=2 3
+Restart=on-failure
+RestartSec=15
+
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
