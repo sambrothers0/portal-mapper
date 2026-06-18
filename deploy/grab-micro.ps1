@@ -28,7 +28,13 @@ $_wakeType = Add-Type -MemberDefinition '[DllImport("kernel32.dll")] public stat
 $_wakeType::SetThreadExecutionState([Convert]::ToUInt32('80000003', 16))  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
 try { } finally { }  # defer reset to script exit below
 
-$OCI         = "C:\Users\samjb\ocienv\Scripts\oci.exe"
+# The OCI CLI venv lives at a long path that overflows Windows' 260-char limit,
+# which makes oci.exe's launcher die SILENTLY (empty output, exit 1). It only
+# works through a short subst drive. subst is per-session, so (re)create it here.
+$OCI_VENV    = "C:\Users\samjb\ocienv"
+if (-not (Test-Path "O:\Scripts\oci.exe")) { subst O: $OCI_VENV | Out-Null }
+$OCI         = "O:\Scripts\oci.exe"
+$env:SUPPRESS_LABEL_WARNING = "True"   # silence oci's API-key stderr note (else it pollutes captured output)
 $COMPARTMENT = "ocid1.tenancy.oc1..aaaaaaaana5ot43k5qutlhxxwybavgy45snzgmisruhn4h7hatzlfret6zwq"
 $SUBNET      = "ocid1.subnet.oc1.iad.aaaaaaaa2zgjdq6z5zp5vc7hompzpcafdxxs5sduxdrzkqfzcsdwdst6775a"
 $SSH_PUB     = "$env:USERPROFILE\.ssh\portal-mapper-oracle.pub"
@@ -74,7 +80,9 @@ function Notify($title, $body) {
 # Done at startup (not hardcoded) so the OCID can never go stale, and so a bad
 # image lookup fails loud before we start hammering the launch API.
 Log "Resolving latest x86_64 Oracle Linux image for $SHAPE..."
-$IMAGE = (& $OCI compute image list `
+# 2>&1 merges OCI's stderr (benign API-key / pagination warnings) into the text,
+# so extract the OCID by pattern rather than expecting it at the start.
+$imgOut = (& $OCI compute image list `
     --compartment-id          $COMPARTMENT `
     --operating-system        "Oracle Linux" `
     --operating-system-version "9" `
@@ -84,7 +92,8 @@ $IMAGE = (& $OCI compute image list `
     --limit                   1 `
     @authArgs `
     --query                   'data[0].id' `
-    --raw-output 2>&1 | Out-String).Trim()
+    --raw-output 2>&1 | Out-String)
+$IMAGE = if ($imgOut -match 'ocid1\.image\.\S+') { $matches[0] } else { $imgOut.Trim() }
 
 if ($IMAGE -notmatch '^ocid1\.image\.') {
     Log "ERROR - could not resolve an image OCID. Got: $IMAGE"
